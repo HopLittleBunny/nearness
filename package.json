@@ -1,0 +1,87 @@
+{
+  "name": "nearness",
+  "private": true,
+  "version": "1.0.0-rc.1",
+  "description": "A private, local-first relationship atlas for friends, family, groups and life chapters.",
+  "author": "Nearness",
+  "license": "MIT",
+  "type": "module",
+  "main": "electron/main.mjs",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "dev:desktop": "concurrently -k -s first \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env NEARNESS_DEV_URL=http://127.0.0.1:5173 electron electron/main.mjs\"",
+    "dev:founder": "node scripts/founder-dev.mjs",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "npm run test && npm run build",
+    "package:mac": "npm run verify && electron-builder --mac dmg zip --arm64",
+    "start": "electron electron/main.mjs"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "libphonenumber-js": "^1.12.29",
+    "lucide-react": "latest",
+    "openai": "^6.24.0",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "latest",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "43.4.1",
+    "electron-builder": "^26.8.1",
+    "vite": "latest",
+    "vitest": "^4.1.0",
+    "wait-on": "^9.0.4"
+  },
+  "build": {
+    "appId": "com.nearness.atlas",
+    "productName": "Nearness",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.lifestyle",
+      "icon": "build/icon.png",
+      "minimumSystemVersion": "13.0",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "dmg": {
+      "title": "Nearness ${version}",
+      "backgroundColor": "#06131b",
+      "window": {
+        "width": 560,
+        "height": 380
+      },
+      "contents": [
+        {
+          "x": 160,
+          "y": 190
+        },
+        {
+          "x": 400,
+          "y": 190,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "artifactName": "Nearness-${version}-${arch}.${ext}"
+  }
+}
