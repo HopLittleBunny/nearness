@@ -29,6 +29,11 @@ function redactPreviewBody(value) {
     .slice(0, 120)
 }
 
+function importedArchiveHashes(source) {
+  if (!source) return []
+  try { return JSON.parse(source.config_json || '{}').importedArchiveHashes || [] } catch { return [] }
+}
+
 export class ImportService {
   constructor({ vault, identityService }) {
     this.vault = vault
@@ -61,7 +66,11 @@ export class ImportService {
 
   async readWhatsAppPayload(path) {
     const raw = await readFile(path)
-    if (extname(path).toLowerCase() !== '.zip') return { text: raw.toString('utf8'), sourceBytes: raw, innerName: basename(path) }
+    return this.readWhatsAppBytes(raw, basename(path))
+  }
+
+  async readWhatsAppBytes(raw, fileName) {
+    if (extname(fileName).toLowerCase() !== '.zip') return { text: raw.toString('utf8'), sourceBytes: raw, innerName: fileName }
     const zip = await JSZip.loadAsync(raw)
     const entries = Object.values(zip.files)
       .filter((entry) => !entry.dir && entry.name.toLowerCase().endsWith('.txt'))
@@ -74,16 +83,39 @@ export class ImportService {
   async previewWhatsApp(path) {
     const { text, sourceBytes, innerName } = await this.readWhatsAppPayload(path)
     const label = safeLabel(path, safeLabel(innerName, 'WhatsApp conversation'))
+    return this.buildWhatsAppPreview({ text, sourceBytes, label })
+  }
+
+  async previewWhatsAppBytes({ name, bytes }) {
+    const sourceBytes = Buffer.from(bytes)
+    if (!sourceBytes.length) throw new Error('That WhatsApp export is empty.')
+    if (sourceBytes.length > 250 * 1024 * 1024) throw new Error('That export is over 250 MB. Export the chat without media and try again.')
+    const fileName = basename(String(name || 'WhatsApp export.txt'))
+    if (!['.zip', '.txt'].includes(extname(fileName).toLowerCase())) throw new Error('Choose a WhatsApp ZIP or TXT export.')
+    const payload = await this.readWhatsAppBytes(sourceBytes, fileName)
+    const label = safeLabel(fileName, safeLabel(payload.innerName, 'WhatsApp conversation'))
+    return this.buildWhatsAppPreview({ text: payload.text, sourceBytes: payload.sourceBytes, label })
+  }
+
+  buildWhatsAppPreview({ text, sourceBytes, label }) {
     const sourceHash = sha256(sourceBytes)
-    const existingSourceId = this.vault.getSourceIdByHash(sourceHash)
     const parsed = parseWhatsAppText(text, { sourceName: label })
     if (!parsed.messages.length) throw new Error('No readable WhatsApp messages were found. Export the chat “without media” or as a ZIP/TXT and try again.')
-    const previewId = this.remember('whatsapp', { path, label, sourceHash, parsed })
+    const firstMessage = parsed.messages[0]
+    const sourceKey = sha256(`whatsapp|${firstMessage.sentAt}|${normalizeName(firstMessage.sender).toLowerCase()}|${firstMessage.body}|${firstMessage.attachmentCount}`)
+    const existingSource = this.vault.findSourceByKey('whatsapp', sourceKey)
+      || this.vault.findWhatsAppSourceByFirstMessage(firstMessage)
+      || this.vault.findSourceByHash(sourceHash)
+    const previousArchiveHashes = importedArchiveHashes(existingSource)
+    const duplicate = existingSource?.source_hash === sourceHash || previousArchiveHashes.includes(sourceHash)
+    const previewId = this.remember('whatsapp', { label, sourceHash, sourceKey, text, parsed })
     return {
       previewId,
       label,
-      duplicate: Boolean(existingSourceId),
+      duplicate: Boolean(duplicate),
+      updatesExisting: Boolean(existingSource && !duplicate),
       dateOrder: parsed.dateOrder,
+      dateOrderAmbiguous: parsed.dateOrderAmbiguous,
       dateFormatLabel: parsed.dateFormatLabel,
       messageCount: parsed.messages.length,
       participantCount: parsed.participants.length,
@@ -101,52 +133,97 @@ export class ImportService {
     }
   }
 
-  commitWhatsApp({ previewId, selfName, conversationTitle = null }) {
+  updateWhatsAppDateOrder({ previewId, dateOrder }) {
+    if (!['dmy', 'mdy', 'ymd'].includes(dateOrder)) throw new Error('Choose day/month, month/day, or year/month date order.')
     const preview = this.take(previewId, 'whatsapp')
-    if (this.vault.getSourceIdByHash(preview.sourceHash)) throw new Error('This exact WhatsApp export is already in your vault.')
+    preview.parsed = parseWhatsAppText(preview.text, { sourceName: preview.label, dateOrder })
+    if (!preview.parsed.messages.length) throw new Error('No readable messages were found with that date order.')
+    return {
+      dateOrder: preview.parsed.dateOrder,
+      dateOrderAmbiguous: false,
+      dateFormatLabel: preview.parsed.dateFormatLabel,
+      startAt: preview.parsed.startAt,
+      endAt: preview.parsed.endAt,
+      rejectedLines: preview.parsed.rejectedLines,
+      sample: preview.parsed.messages.slice(0, 3).map((message) => ({
+        sentAt: message.sentAt,
+        sender: message.sender,
+        body: redactPreviewBody(message.body),
+      })),
+    }
+  }
+
+  async commitWhatsApp({ previewId, selfName, conversationTitle = null, isGroup = null }) {
+    const preview = this.take(previewId, 'whatsapp')
+    const existingSource = this.vault.findSourceByKey('whatsapp', preview.sourceKey)
+      || this.vault.findWhatsAppSourceByFirstMessage(preview.parsed.messages[0])
+      || this.vault.findSourceByHash(preview.sourceHash)
+    const previousArchiveHashes = importedArchiveHashes(existingSource)
+    if (existingSource?.source_hash === preview.sourceHash || previousArchiveHashes.includes(preview.sourceHash)) throw new Error('This exact WhatsApp export is already in your vault.')
     const me = normalizeName(selfName)
     if (!me || !preview.parsed.participants.some((name) => normalizeName(name).toLowerCase() === me.toLowerCase())) {
       throw new Error('Choose your own name exactly as it appears in this export.')
     }
 
-    const result = this.vault.transaction(() => {
-      const sourceId = this.vault.createSource({
-        type: 'whatsapp', label: preview.label, sourceHash: preview.sourceHash,
-        status: 'imported', startAt: preview.parsed.startAt, endAt: preview.parsed.endAt,
-        config: { dateOrder: preview.parsed.dateOrder, ignoredSystemMessages: preview.parsed.systemMessages },
-      })
-      const identities = new Map()
-      for (const name of preview.parsed.participants) {
-        const isSelf = normalizeName(name).toLowerCase() === me.toLowerCase()
-        const identityId = this.vault.upsertIdentity({
-          sourceId, externalId: `name:${normalizeName(name).toLowerCase()}`, kind: 'whatsapp_name',
-          displayName: name, isSelf,
+    let createdNewSource = false
+    let sourceId = null
+    let conversationId = null
+    try {
+      const setup = this.vault.transaction(() => {
+        const sourceId = existingSource?.id || this.vault.createSource({
+          type: 'whatsapp', label: preview.label, sourceHash: preview.sourceHash, sourceKey: preview.sourceKey,
+          status: existingSource ? 'imported' : 'importing', startAt: preview.parsed.startAt, endAt: preview.parsed.endAt,
+          config: { dateOrder: preview.parsed.dateOrder, ignoredSystemMessages: preview.parsed.systemMessages, importedArchiveHashes: [] },
         })
-        identities.set(name, identityId)
-        if (!isSelf) this.vault.ensurePersonForIdentity(identityId)
-      }
-      const title = normalizeName(conversationTitle) || preview.label || preview.parsed.participants.filter((name) => name !== selfName).join(', ')
-      const conversationId = this.vault.upsertConversation({
-        sourceId, externalId: `whatsapp:${preview.sourceHash.slice(0, 20)}`, title,
-        isGroup: preview.parsed.isGroup, service: 'WhatsApp', startAt: preview.parsed.startAt,
-        endAt: preview.parsed.endAt, messageCount: preview.parsed.messages.length,
-        participantCount: preview.parsed.participants.length,
-      })
-      for (const identityId of identities.values()) this.vault.linkConversationIdentity(conversationId, identityId)
-      for (const message of preview.parsed.messages) {
-        const senderIdentityId = identities.get(message.sender) || null
-        this.vault.insertMessage({
-          sourceId, conversationId, externalId: message.id, senderIdentityId,
-          sentAt: message.sentAt, isFromMe: normalizeName(message.sender).toLowerCase() === me.toLowerCase(),
-          body: message.body, attachmentCount: message.attachmentCount,
+        createdNewSource = !existingSource
+        const identities = new Map()
+        for (const name of preview.parsed.participants) {
+          const isSelf = normalizeName(name).toLowerCase() === me.toLowerCase()
+          const identityId = this.vault.upsertIdentity({
+            sourceId, externalId: `name:${normalizeName(name).toLowerCase()}`, kind: 'whatsapp_name',
+            displayName: name, isSelf,
+          })
+          identities.set(name, identityId)
+          if (!isSelf) this.vault.ensurePersonForIdentity(identityId)
+        }
+        const title = normalizeName(conversationTitle) || preview.label || preview.parsed.participants.filter((name) => name !== selfName).join(', ')
+        const conversationId = this.vault.upsertConversation({
+          sourceId, externalId: `whatsapp:${preview.sourceKey.slice(0, 20)}`, stableKey: `whatsapp:${preview.sourceKey}`, title,
+          isGroup: typeof isGroup === 'boolean' ? isGroup : preview.parsed.isGroup, service: 'WhatsApp', startAt: preview.parsed.startAt,
+          endAt: preview.parsed.endAt, messageCount: preview.parsed.messages.length,
+          participantCount: preview.parsed.participants.length,
         })
+        for (const identityId of identities.values()) this.vault.linkConversationIdentity(conversationId, identityId)
+        return { sourceId, conversationId, identities }
+      })
+      sourceId = setup.sourceId
+      conversationId = setup.conversationId
+      const batchSize = 750
+      for (let offset = 0; offset < preview.parsed.messages.length; offset += batchSize) {
+        const batch = preview.parsed.messages.slice(offset, offset + batchSize).map((message) => {
+          const senderIdentityId = setup.identities.get(message.sender) || null
+          return {
+            sourceId, conversationId, externalId: message.id,
+            eventFingerprint: sha256(`${message.sentAt}|${normalizeName(message.sender).toLowerCase()}|${message.body}|${message.attachmentCount}`), senderIdentityId,
+            sentAt: message.sentAt, isFromMe: normalizeName(message.sender).toLowerCase() === me.toLowerCase(),
+            body: message.body, attachmentCount: message.attachmentCount,
+          }
+        })
+        this.vault.transaction(() => this.vault.insertMessages(batch))
+        await new Promise((resolve) => setImmediate(resolve))
       }
-      this.vault.updateSourceCounts(sourceId)
-      return { sourceId, conversationId }
-    })
-    this.previews.delete(previewId)
-    const proposals = this.identityService.rebuildProposals()
-    return { ...result, proposals, bootstrap: this.vault.getBootstrap() }
+      this.vault.transaction(() => {
+        this.vault.updateConversationCounts(conversationId)
+        this.vault.recordSourceImport(sourceId, preview.sourceHash, { dateOrder: preview.parsed.dateOrder, ignoredSystemMessages: preview.parsed.systemMessages }, preview.sourceKey)
+        this.vault.updateSourceCounts(sourceId)
+      })
+      this.previews.delete(previewId)
+      const proposals = this.identityService.rebuildProposals()
+      return { sourceId, conversationId, proposals, bootstrap: this.vault.getBootstrap() }
+    } catch (error) {
+      if (createdNewSource && sourceId) this.vault.deleteSource(sourceId)
+      throw error
+    }
   }
 
   async previewVCard(path) {
@@ -177,18 +254,16 @@ export class ImportService {
         status: 'imported', participantCount: preview.contacts.length,
       })
       for (const contact of preview.contacts) {
-        const personId = this.vault.createPerson({ displayName: contact.displayName })
         const handles = [
           ...contact.phones.map((handle) => ({ handle: normalizeHandle(handle, defaultCountry), kind: 'phone' })),
           ...contact.emails.map((handle) => ({ handle: normalizeHandle(handle, defaultCountry), kind: 'email' })),
         ].filter((entry) => entry.handle)
         for (const [index, entry] of handles.entries()) {
-          const identityId = this.vault.upsertIdentity({
+          this.vault.upsertIdentity({
             sourceId: id, externalId: `${contact.id}:${entry.kind}:${index}`,
             kind: entry.kind, displayName: contact.displayName, handle: entry.handle,
             metadata: { importedFromContactCard: true },
           })
-          this.vault.linkIdentityToPerson(personId, identityId, { decision: 'same_contact_card', confidenceLabel: 'source_confirmed' })
         }
       }
       this.vault.updateSourceCounts(id)
@@ -267,15 +342,16 @@ export class ImportService {
           })
           this.vault.linkConversationIdentity(conversationId, selfIdentityId)
           for (const identityId of identityMap.values()) this.vault.linkConversationIdentity(conversationId, identityId)
-          for (const message of chat.messages) {
+          const messageRows = chat.messages.map((message) => {
             const senderIdentityId = message.isFromMe ? selfIdentityId : (identityMap.get(message.senderHandle) || identityMap.get(chat.identifier) || null)
-            this.vault.insertMessage({
+            return {
               sourceId: id, conversationId, externalId: message.id, senderIdentityId,
               sentAt: message.sentAt, isFromMe: message.isFromMe, body: message.body,
               attachmentCount: message.attachmentCount, replyToExternalId: message.replyToExternalId,
               metadata: { service: message.service },
-            })
-          }
+            }
+          })
+          this.vault.insertMessages(messageRows)
         }
         this.vault.updateSourceCounts(id)
         return id

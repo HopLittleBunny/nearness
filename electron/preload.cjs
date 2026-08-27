@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld('nearness', Object.freeze({
   finishOnboarding: () => invoke('app:finishOnboarding'),
   import: Object.freeze({
     previewWhatsApp: () => invoke('import:previewWhatsApp'),
+    previewWhatsAppBytes: (input) => invoke('import:previewWhatsAppBytes', input),
+    updateWhatsAppDateOrder: (input) => invoke('import:updateWhatsAppDateOrder', input),
     commitWhatsApp: (input) => invoke('import:commitWhatsApp', input),
     previewVCard: () => invoke('import:previewVCard'),
     commitVCard: (input) => invoke('import:commitVCard', input),

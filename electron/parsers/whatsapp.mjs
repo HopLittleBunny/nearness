@@ -17,9 +17,10 @@ function inferDateOrder(dateParts) {
     else if (b > 12) mdy += 3
     if (c > 31) { dmy += 1; mdy += 1 }
   }
-  if (ymd > dmy && ymd > mdy) return 'ymd'
-  if (mdy > dmy) return 'mdy'
-  return 'dmy'
+  if (ymd > dmy && ymd > mdy) return { order: 'ymd', ambiguous: false }
+  if (mdy > dmy) return { order: 'mdy', ambiguous: false }
+  if (dmy > mdy) return { order: 'dmy', ambiguous: false }
+  return { order: 'dmy', ambiguous: true }
 }
 
 function parseDate(dateText, timeText, order) {
@@ -57,7 +58,8 @@ export function parseWhatsAppText(text, { dateOrder = 'auto', sourceName = 'What
   const cleanText = String(text || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n')
   const lines = cleanText.split('\n')
   const candidateDates = lines.slice(0, 2500).map((line) => line.match(DATE_PREFIX)?.[1]).filter(Boolean)
-  const resolvedOrder = dateOrder === 'auto' ? inferDateOrder(candidateDates) : dateOrder
+  const inferred = dateOrder === 'auto' ? inferDateOrder(candidateDates) : { order: dateOrder, ambiguous: false }
+  const resolvedOrder = inferred.order
   const messages = []
   let current = null
   let rejected = 0
@@ -90,6 +92,7 @@ export function parseWhatsAppText(text, { dateOrder = 'auto', sourceName = 'What
   return {
     sourceName,
     dateOrder: resolvedOrder,
+    dateOrderAmbiguous: inferred.ambiguous,
     dateFormatLabel: resolvedOrder === 'mdy' ? '12/31/2025' : resolvedOrder === 'ymd' ? '2025/12/31' : '31/12/2025',
     messages: humanMessages,
     systemMessages: messages.length - humanMessages.length,

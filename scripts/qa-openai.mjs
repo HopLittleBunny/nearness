@@ -33,7 +33,8 @@ try {
   messages.forEach(([senderIdentityId, isFromMe, sentAt, body], index) => vault.insertMessage({ sourceId, conversationId, externalId: `qa-${index}`, senderIdentityId, sentAt, isFromMe, body }))
   const keyStore = { getOpenAiKey: async () => apiKey }
   const analysis = new AnalysisService({ vault, keyStore })
-  const result = await analysis.analyzePerson({ personId, consent: true })
+  const inspected = analysis.inspectPayload(personId)
+  const result = await analysis.analyzePerson({ personId, consent: true, consentHash: inspected.payloadHash })
   process.stdout.write(JSON.stringify({ model: result.analysis?.model, portraitCreated: Boolean(result.portrait), evidenceBoundObservations: result.observations?.length || 0 }))
 } finally {
   vault?.close()

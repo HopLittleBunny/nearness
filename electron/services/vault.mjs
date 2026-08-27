@@ -42,6 +42,7 @@ export class Vault {
         type TEXT NOT NULL,
         label_cipher BLOB NOT NULL,
         source_hash TEXT NOT NULL UNIQUE,
+        source_key TEXT,
         imported_at TEXT NOT NULL,
         status TEXT NOT NULL,
         message_count INTEGER NOT NULL DEFAULT 0,
@@ -102,6 +103,7 @@ export class Vault {
         id TEXT PRIMARY KEY,
         source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
         external_id TEXT NOT NULL,
+        stable_key TEXT,
         title_cipher BLOB NOT NULL,
         is_group INTEGER NOT NULL DEFAULT 0,
         service TEXT NOT NULL,
@@ -122,6 +124,7 @@ export class Vault {
         source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
         conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         external_id TEXT NOT NULL,
+        event_fingerprint TEXT,
         sender_identity_id TEXT REFERENCES identities(id) ON DELETE SET NULL,
         sent_at TEXT NOT NULL,
         is_from_me INTEGER NOT NULL DEFAULT 0,
@@ -192,7 +195,22 @@ export class Vault {
       CREATE INDEX IF NOT EXISTS idx_observations_person ON observations(person_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_care_actions_status ON care_actions(status, due_at);
     `)
-    this.db.prepare('INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)').run('schema_version', '1')
+    const schemaVersion = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()?.value || 0)
+    if (schemaVersion < 2) {
+      const ensureColumn = (table, column, definition) => {
+        const present = this.db.prepare(`PRAGMA table_info(${table})`).all().some((item) => item.name === column)
+        if (!present) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+      }
+      ensureColumn('sources', 'source_key', 'TEXT')
+      ensureColumn('conversations', 'stable_key', 'TEXT')
+      ensureColumn('messages', 'event_fingerprint', 'TEXT')
+      this.db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sources_type_key ON sources(type, source_key) WHERE source_key IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_service_key ON conversations(service, stable_key) WHERE stable_key IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_conversation_fingerprint ON messages(conversation_id, event_fingerprint) WHERE event_fingerprint IS NOT NULL;
+      `)
+      this.db.prepare('INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)').run('schema_version', '2')
+    }
   }
 
   close() {
@@ -267,13 +285,38 @@ export class Vault {
     return this.findSourceByHash(sourceHash)?.id || null
   }
 
-  createSource({ type, label, sourceHash, status = 'imported', messageCount = 0, conversationCount = 0, participantCount = 0, startAt = null, endAt = null, config = {} }) {
+  findSourceByKey(type, sourceKey) {
+    if (!sourceKey) return null
+    return this.db.prepare('SELECT * FROM sources WHERE type = ? AND source_key = ?').get(type, this.hash(`source-key:${sourceKey}`)) || null
+  }
+
+  findWhatsAppSourceByFirstMessage({ sentAt, body }) {
+    if (!sentAt) return null
+    return this.db.prepare(`
+      SELECT s.* FROM sources s
+      JOIN messages m ON m.source_id = s.id
+      WHERE s.type = 'whatsapp' AND m.sent_at = ? AND m.body_hash = ?
+      LIMIT 1
+    `).get(sentAt, body ? this.hash(`body:${body}`) : null) || null
+  }
+
+  createSource({ type, label, sourceHash, sourceKey = null, status = 'imported', messageCount = 0, conversationCount = 0, participantCount = 0, startAt = null, endAt = null, config = {} }) {
     const id = randomUUID()
     this.db.prepare(`
-      INSERT INTO sources(id, type, label_cipher, source_hash, imported_at, status, message_count, conversation_count, participant_count, start_at, end_at, config_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, type, this.encrypt(label), sourceHash, nowIso(), status, messageCount, conversationCount, participantCount, startAt, endAt, JSON.stringify(config))
+      INSERT INTO sources(id, type, label_cipher, source_hash, source_key, imported_at, status, message_count, conversation_count, participant_count, start_at, end_at, config_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, type, this.encrypt(label), sourceHash, sourceKey ? this.hash(`source-key:${sourceKey}`) : null, nowIso(), status, messageCount, conversationCount, participantCount, startAt, endAt, JSON.stringify(config))
     return id
+  }
+
+  recordSourceImport(sourceId, archiveHash, configPatch = {}, sourceKey = null) {
+    const row = this.db.prepare('SELECT config_json FROM sources WHERE id = ?').get(sourceId)
+    if (!row) throw new Error('Source not found.')
+    const current = parseJson(row.config_json, {})
+    const importedArchiveHashes = [...new Set([...(current.importedArchiveHashes || []), archiveHash].filter(Boolean))]
+    this.db.prepare("UPDATE sources SET config_json = ?, imported_at = ?, source_key = COALESCE(source_key, ?), status = 'imported' WHERE id = ?").run(
+      JSON.stringify({ ...current, ...configPatch, importedArchiveHashes }), nowIso(), sourceKey ? this.hash(`source-key:${sourceKey}`) : null, sourceId,
+    )
   }
 
   getSources() {
@@ -348,30 +391,52 @@ export class Vault {
     return personId
   }
 
-  upsertConversation({ sourceId, externalId, title, isGroup = false, service, startAt = null, endAt = null, messageCount = 0, participantCount = 0, metadata = {} }) {
+  upsertConversation({ sourceId, externalId, stableKey = null, title, isGroup = false, service, startAt = null, endAt = null, messageCount = 0, participantCount = 0, metadata = {} }) {
     const externalKey = this.hash(`conversation:${externalId}`)
-    const existing = this.db.prepare('SELECT id FROM conversations WHERE source_id = ? AND external_id = ?').get(sourceId, externalKey)
-    if (existing) return existing.id
+    const hashedStableKey = stableKey ? this.hash(`conversation-key:${stableKey}`) : null
+    const existing = hashedStableKey
+      ? this.db.prepare('SELECT id FROM conversations WHERE service = ? AND stable_key = ?').get(service, hashedStableKey)
+      : this.db.prepare('SELECT id FROM conversations WHERE source_id = ? AND external_id = ?').get(sourceId, externalKey)
+    if (existing) {
+      this.db.prepare(`UPDATE conversations SET title_cipher=?, is_group=?, start_at=CASE WHEN start_at IS NULL OR ? < start_at THEN ? ELSE start_at END, end_at=CASE WHEN end_at IS NULL OR ? > end_at THEN ? ELSE end_at END, participant_count=MAX(participant_count, ?) WHERE id=?`).run(
+        this.encrypt(title), isGroup ? 1 : 0, startAt, startAt, endAt, endAt, participantCount, existing.id,
+      )
+      return existing.id
+    }
     const id = randomUUID()
     this.db.prepare(`
-      INSERT INTO conversations(id, source_id, external_id, title_cipher, is_group, service, start_at, end_at, message_count, participant_count, metadata_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, sourceId, externalKey, this.encrypt(title), isGroup ? 1 : 0, service, startAt, endAt, messageCount, participantCount, JSON.stringify(metadata))
+      INSERT INTO conversations(id, source_id, external_id, stable_key, title_cipher, is_group, service, start_at, end_at, message_count, participant_count, metadata_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, sourceId, externalKey, hashedStableKey, this.encrypt(title), isGroup ? 1 : 0, service, startAt, endAt, messageCount, participantCount, JSON.stringify(metadata))
     return id
+  }
+
+  updateConversationCounts(conversationId) {
+    const stats = this.db.prepare('SELECT COUNT(*) AS message_count, MIN(sent_at) AS start_at, MAX(sent_at) AS end_at FROM messages WHERE conversation_id = ?').get(conversationId)
+    this.db.prepare('UPDATE conversations SET message_count=?, start_at=?, end_at=? WHERE id=?').run(stats.message_count, stats.start_at, stats.end_at, conversationId)
   }
 
   linkConversationIdentity(conversationId, identityId) {
     this.db.prepare('INSERT OR IGNORE INTO conversation_identities(conversation_id, identity_id) VALUES (?, ?)').run(conversationId, identityId)
   }
 
-  insertMessage({ sourceId, conversationId, externalId, senderIdentityId = null, sentAt, isFromMe = false, body = '', attachmentCount = 0, replyToExternalId = null, metadata = {} }) {
-    const id = randomUUID()
-    const externalKey = this.hash(`message:${externalId}`)
-    this.db.prepare(`
-      INSERT OR IGNORE INTO messages(id, source_id, conversation_id, external_id, sender_identity_id, sent_at, is_from_me, body_cipher, body_hash, attachment_count, reply_to_external_id, metadata_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, sourceId, conversationId, externalKey, senderIdentityId, sentAt, isFromMe ? 1 : 0, body ? this.encrypt(body) : null, body ? this.hash(`body:${body}`) : null, attachmentCount, replyToExternalId ? this.hash(`message:${replyToExternalId}`) : null, JSON.stringify(metadata))
-    return id
+  insertMessage({ sourceId, conversationId, externalId, eventFingerprint = null, senderIdentityId = null, sentAt, isFromMe = false, body = '', attachmentCount = 0, replyToExternalId = null, metadata = {} }) {
+    return this.insertMessages([{ sourceId, conversationId, externalId, eventFingerprint, senderIdentityId, sentAt, isFromMe, body, attachmentCount, replyToExternalId, metadata }])[0]
+  }
+
+  insertMessages(messages) {
+    const statement = this.db.prepare(`
+      INSERT OR IGNORE INTO messages(id, source_id, conversation_id, external_id, event_fingerprint, sender_identity_id, sent_at, is_from_me, body_cipher, body_hash, attachment_count, reply_to_external_id, metadata_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    const ids = []
+    for (const { sourceId, conversationId, externalId, eventFingerprint = null, senderIdentityId = null, sentAt, isFromMe = false, body = '', attachmentCount = 0, replyToExternalId = null, metadata = {} } of messages) {
+      const id = randomUUID()
+      const externalKey = this.hash(`message:${externalId}`)
+      statement.run(id, sourceId, conversationId, externalKey, eventFingerprint ? this.hash(`event:${eventFingerprint}`) : null, senderIdentityId, sentAt, isFromMe ? 1 : 0, body ? this.encrypt(body) : null, body ? this.hash(`body:${body}`) : null, attachmentCount, replyToExternalId ? this.hash(`message:${replyToExternalId}`) : null, JSON.stringify(metadata))
+      ids.push(id)
+    }
+    return ids
   }
 
   listIdentities() {
@@ -448,11 +513,12 @@ export class Vault {
     const rows = this.db.prepare(`
       SELECT p.*, COUNT(DISTINCT pi.identity_id) AS identity_count,
         COUNT(DISTINCT ci.conversation_id) AS conversation_count,
-        MAX(m.sent_at) AS last_message_at,
-        COUNT(DISTINCT m.id) AS message_count
+        MAX(CASE WHEN c.is_group = 0 THEN m.sent_at END) AS last_message_at,
+        COUNT(DISTINCT CASE WHEN c.is_group = 0 OR m.sender_identity_id = pi.identity_id THEN m.id END) AS message_count
       FROM people p
       LEFT JOIN person_identities pi ON pi.person_id = p.id
       LEFT JOIN conversation_identities ci ON ci.identity_id = pi.identity_id
+      LEFT JOIN conversations c ON c.id = ci.conversation_id
       LEFT JOIN messages m ON m.conversation_id = ci.conversation_id
       GROUP BY p.id
       ORDER BY p.closeness, last_message_at DESC
@@ -480,16 +546,19 @@ export class Vault {
     const row = this.db.prepare(`
       SELECT p.*, COUNT(DISTINCT pi.identity_id) AS identity_count,
         COUNT(DISTINCT ci.conversation_id) AS conversation_count,
-        MAX(m.sent_at) AS last_message_at, COUNT(DISTINCT m.id) AS message_count
+        MAX(CASE WHEN c.is_group = 0 THEN m.sent_at END) AS last_message_at,
+        COUNT(DISTINCT CASE WHEN c.is_group = 0 OR m.sender_identity_id = pi.identity_id THEN m.id END) AS message_count
       FROM people p
       LEFT JOIN person_identities pi ON pi.person_id = p.id
       LEFT JOIN conversation_identities ci ON ci.identity_id = pi.identity_id
+      LEFT JOIN conversations c ON c.id = ci.conversation_id
       LEFT JOIN messages m ON m.conversation_id = ci.conversation_id
       WHERE p.id = ? GROUP BY p.id
     `).get(personId)
     if (!row) return null
     const person = this.personRow(row)
     const messages = this.getMessagesForPerson(personId)
+    const directMessages = messages.filter((message) => !message.isGroup)
     const observations = this.db.prepare('SELECT * FROM observations WHERE person_id = ? ORDER BY created_at DESC').all(personId).map((item) => ({
       id: item.id, statement: this.decrypt(item.statement_cipher), construct: item.construct,
       evidenceType: item.evidence_type, evidenceRefs: parseJson(item.evidence_refs_json, []),
@@ -500,7 +569,7 @@ export class Vault {
     const latestAnalysis = this.db.prepare(`SELECT * FROM analyses WHERE person_id=? AND status='completed' ORDER BY completed_at DESC LIMIT 1`).get(personId)
     return {
       ...person,
-      signals: deriveLocalRelationshipSignals(messages),
+      signals: { ...deriveLocalRelationshipSignals(directMessages), groupAuthoredMessageCount: messages.length - directMessages.length },
       observations,
       portrait: latestAnalysis ? this.decryptJson(latestAnalysis.portrait_cipher, null) : null,
       analysis: latestAnalysis ? { id: latestAnalysis.id, model: latestAnalysis.model, completedAt: latestAnalysis.completed_at, usage: parseJson(latestAnalysis.usage_json, {}) } : null,
@@ -516,12 +585,14 @@ export class Vault {
       LEFT JOIN identities i ON i.id = m.sender_identity_id
       JOIN conversations c ON c.id = m.conversation_id
       WHERE pi.person_id = ?
+        AND (c.is_group = 0 OR m.sender_identity_id = pi.identity_id)
       ORDER BY m.sent_at ASC LIMIT ?
     `).all(personId, limit).map((row) => ({
       id: row.id, externalId: row.external_id, sentAt: row.sent_at, isFromMe: Boolean(row.is_from_me),
       sender: row.is_from_me ? 'Me' : this.decrypt(row.sender_name_cipher, 'Unknown'),
       body: this.decrypt(row.body_cipher, ''), attachmentCount: row.attachment_count,
       conversationId: row.conversation_id, conversationTitle: this.decrypt(row.title_cipher), isGroup: Boolean(row.is_group),
+      evidenceScope: row.is_group ? 'person_in_group' : 'direct_dyadic',
     }))
   }
 
@@ -624,7 +695,9 @@ export class Vault {
     const messageCount = Number(this.db.prepare('SELECT COUNT(*) AS value FROM messages').get().value)
     const analysisCount = Number(this.db.prepare(`SELECT COUNT(DISTINCT person_id) AS value FROM analyses WHERE status='completed'`).get().value)
     return {
-      hasData: sourceCount > 0,
+      // A contacts file is supporting identity data, not a relationship history.
+      // Keep onboarding in the empty state until there is something the atlas can show.
+      hasData: messageCount > 0 || peopleCount > 0,
       sourceCount,
       peopleCount,
       messageCount,
@@ -645,7 +718,7 @@ export class Vault {
     return {
       exportedAt: nowIso(),
       product: 'Nearness',
-      schemaVersion: 1,
+      schemaVersion: 2,
       relationalSelf: this.getRelationalSelf(),
       sources: this.getSources(),
       people: this.getPeople().map((person) => this.getPerson(person.id)),

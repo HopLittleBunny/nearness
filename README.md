@@ -4,13 +4,15 @@ Nearness is a private, local-first relationship atlas for friends, family, chose
 
 It imports history you already own, keeps it in an encrypted vault on your Mac, separates visible evidence from your lived account, and helps you care for selected relationships without rankings, streaks or guilt.
 
-![Nearness first-run experience](design/nearness-v3-implementation.png)
+![Nearness relationship atlas](design/nearness-v4-implementation.png)
 
 ## What is working
 
 - WhatsApp ZIP/TXT imports with multiline, date-order and attachment handling.
+- Updated WhatsApp exports merge into the existing conversation without double-counting earlier messages.
 - Read-only Apple Messages linking from `~/Library/Messages/chat.db`, including modern `attributedBody` text.
 - vCard contact imports for cross-source identity proposals.
+- A two-sender export can be confirmed as a group instead of being silently treated as a direct chat.
 - User-confirmed identity resolution; a name-only match never auto-merges people.
 - A field-encrypted local SQLite vault protected by a macOS secure-storage key.
 - User-controlled bond system, closeness, trajectory, relationship form, social worlds, intention and cadence.
@@ -50,6 +52,8 @@ npm run package:mac
 ```
 
 The resulting DMG and ZIP are written to `release/`. Public distribution also requires an Apple Developer ID certificate and notarization; an unsigned build is suitable for founder testing but macOS will show the standard unidentified-developer warning.
+
+For a founder test, import one WhatsApp conversation first, confirm who you are in the preview, then add what the archive cannot know from the person story. AI analysis is optional and only becomes available after the exact redacted payload is reviewed and approved for that run.
 
 ## Privacy architecture
 

@@ -1,7 +1,7 @@
 {
   "name": "nearness",
   "private": true,
-  "version": "1.0.0-rc.1",
+  "version": "1.0.0-rc.4",
   "description": "A private, local-first relationship atlas for friends, family, groups and life chapters.",
   "author": "Nearness",
   "license": "MIT",

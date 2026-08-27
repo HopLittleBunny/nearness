@@ -1,4 +1,4 @@
-import { ipcMain, dialog, shell } from 'electron'
+import { BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { writeFile } from 'node:fs/promises'
 
 function presentError(error) {
@@ -18,8 +18,12 @@ function handle(channel, fn) {
   })
 }
 
-async function chooseFile(options) {
-  const result = await dialog.showOpenDialog({ properties: ['openFile'], ...options })
+async function chooseFile(event, options) {
+  const parent = BrowserWindow.fromWebContents(event.sender)
+  const dialogOptions = { properties: ['openFile'], ...options }
+  const result = parent
+    ? await dialog.showOpenDialog(parent, dialogOptions)
+    : await dialog.showOpenDialog(dialogOptions)
   return result.canceled ? null : result.filePaths[0]
 }
 
@@ -36,13 +40,15 @@ export function registerIpc(runtime) {
   }))
   handle('app:finishOnboarding', () => runtime.vault.finishOnboarding())
 
-  handle('import:previewWhatsApp', async () => {
-    const path = await chooseFile({ title: 'Choose a WhatsApp export', filters: [{ name: 'WhatsApp export', extensions: ['zip', 'txt'] }] })
+  handle('import:previewWhatsApp', async (event) => {
+    const path = await chooseFile(event, { title: 'Choose a WhatsApp export', filters: [{ name: 'WhatsApp export', extensions: ['zip', 'txt'] }] })
     return path ? runtime.importService.previewWhatsApp(path) : null
   })
+  handle('import:previewWhatsAppBytes', (_, input) => runtime.importService.previewWhatsAppBytes(input))
+  handle('import:updateWhatsAppDateOrder', (_, input) => runtime.importService.updateWhatsAppDateOrder(input))
   handle('import:commitWhatsApp', (_, input) => runtime.importService.commitWhatsApp(input))
-  handle('import:previewVCard', async () => {
-    const path = await chooseFile({ title: 'Choose a contacts export', filters: [{ name: 'vCard contacts', extensions: ['vcf', 'vcard'] }] })
+  handle('import:previewVCard', async (event) => {
+    const path = await chooseFile(event, { title: 'Choose a contacts export', filters: [{ name: 'vCard contacts', extensions: ['vcf', 'vcard'] }] })
     return path ? runtime.importService.previewVCard(path) : null
   })
   handle('import:commitVCard', (_, input) => runtime.importService.commitVCard(input))

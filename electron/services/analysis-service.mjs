@@ -1,4 +1,5 @@
 import OpenAI from 'openai'
+import { createHash } from 'node:crypto'
 import { EXPERIENCE_DIMENSIONS, PROHIBITED_INFERENCES, RELATIONSHIP_FORMS, SOCIAL_WORLDS, TRAJECTORIES, validateObservation } from '../domain/framework.mjs'
 
 const DEFAULT_MODEL = 'gpt-5.6-luna'
@@ -19,6 +20,24 @@ export function redactExcerpt(value, names = []) {
     text = text.replace(new RegExp(`\\b${String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi'), '[person]')
   }
   return text.slice(0, MAX_BODY_CHARS)
+}
+
+function redactPayloadValue(value, names) {
+  if (typeof value === 'string') return redactExcerpt(value, names)
+  if (Array.isArray(value)) return value.map((item) => redactPayloadValue(item, names))
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactPayloadValue(item, names)]))
+  }
+  return value
+}
+
+function payloadHash(payload) {
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex')
+}
+
+function containsProhibitedInference(value) {
+  const text = String(value || '').toLowerCase()
+  return PROHIBITED_INFERENCES.some((term) => text.includes(term))
 }
 
 function chooseRepresentativeMessages(messages, limit = MAX_EXCERPTS) {
@@ -116,16 +135,18 @@ export class AnalysisService {
     const messages = this.vault.getMessagesForPerson(personId)
     if (!messages.length) throw new Error('There is no visible message history for this person yet.')
     const selected = chooseRepresentativeMessages(messages)
-    const names = [person.displayName, ...new Set(messages.map((message) => message.sender))]
+    const relationalSelf = this.vault.getRelationalSelf()
+    const names = [person.displayName, relationalSelf?.displayName, ...new Set(messages.map((message) => message.sender))]
     const excerpts = selected.map((message) => ({
       id: message.id,
       date: message.sentAt,
-      direction: message.isFromMe ? 'from_user' : 'to_user',
+      direction: message.isFromMe ? 'from_user' : 'from_person',
       context: message.isGroup ? 'group' : 'one_to_one',
+      evidenceScope: message.evidenceScope,
       body: redactExcerpt(message.body, names),
       attachmentCount: message.attachmentCount,
     })).filter((message) => message.body || message.attachmentCount)
-    return {
+    const payload = {
       person: {
         label: 'this person',
         userChosenClass: person.primaryClass,
@@ -136,7 +157,7 @@ export class AnalysisService {
         userChosenSocialWorlds: person.socialWorlds,
         userNotes: redactExcerpt(person.notes, names),
       },
-      relationalSelf: this.vault.getRelationalSelf(),
+      relationalSelf,
       localSignals: person.signals,
       coverage: {
         totalVisibleMessages: messages.length,
@@ -147,16 +168,20 @@ export class AnalysisService {
       },
       excerpts,
     }
+    return redactPayloadValue(payload, names)
   }
 
   inspectPayload(personId) {
     const payload = this.buildPayload(personId)
+    const hash = payloadHash(payload)
     return {
       model: this.model,
       store: false,
       redactions: ['names', 'phone numbers', 'email addresses', 'web links', 'street-like addresses'],
       coverage: payload.coverage,
-      excerptSample: payload.excerpts.slice(0, 12),
+      payload,
+      excerptSample: payload.excerpts,
+      payloadHash: hash,
       payloadBytes: Buffer.byteLength(JSON.stringify(payload)),
     }
   }
@@ -167,9 +192,11 @@ export class AnalysisService {
     return { configured: true, model: model.id }
   }
 
-  async analyzePerson({ personId, consent }) {
+  async analyzePerson({ personId, consent, consentHash }) {
     if (consent !== true) throw new Error('Analysis only runs after you confirm what will be sent.')
     const payload = this.buildPayload(personId)
+    const currentHash = payloadHash(payload)
+    if (!consentHash || consentHash !== currentHash) throw new Error('The inspected payload changed or was not confirmed. Inspect it again before analysis.')
     const client = await this.client()
     try {
       const response = await client.responses.create({
@@ -186,6 +213,8 @@ export class AnalysisService {
         ],
       })
       const result = parseOutput(response)
+      const portraitText = Object.values(result.portrait || {}).flat().join(' ')
+      if (containsProhibitedInference(portraitText)) throw new Error('The generated portrait crossed a prohibited inference boundary and was not saved.')
       const allowedRefs = new Set(payload.excerpts.map((excerpt) => excerpt.id))
       const observations = (result.observations || []).map((observation) => ({
         ...observation,
@@ -206,27 +235,8 @@ export class AnalysisService {
   }
 
   async askPerson({ personId, question, consent }) {
-    if (consent !== true) throw new Error('Ask only runs after you confirm that redacted excerpts may be sent.')
-    const prompt = cleanText(question).slice(0, 800)
-    if (!prompt) throw new Error('Ask a question first.')
-    const payload = this.buildPayload(personId)
-    const client = await this.client()
-    const response = await client.responses.create({
-      model: this.model,
-      store: false,
-      reasoning: { effort: 'low' },
-      text: { format: { type: 'json_schema', name: 'nearness_evidence_answer', strict: true, schema: answerSchema() } },
-      input: [
-        {
-          role: 'developer',
-          content: `Answer only from the supplied redacted history and user context. Do not diagnose, mind-read, rank, label the person, or claim what they feel. State when the history cannot answer. Cite excerpt IDs. Forbidden inferences: ${PROHIBITED_INFERENCES.join('; ')}.`,
-        },
-        { role: 'user', content: JSON.stringify({ question: prompt, context: payload }) },
-      ],
-    })
-    const result = parseOutput(response)
-    const allowedRefs = new Set(payload.excerpts.map((excerpt) => excerpt.id))
-    return { ...result, evidenceRefs: (result.evidenceRefs || []).filter((id) => allowedRefs.has(id)), model: this.model }
+    void personId; void question; void consent
+    throw new Error('Ask is paused until its exact question-and-evidence payload can be inspected and confirmed. Portrait analysis remains available after exact payload review.')
   }
 }
 

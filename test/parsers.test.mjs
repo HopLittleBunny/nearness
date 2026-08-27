@@ -12,12 +12,26 @@ describe('WhatsApp parser', () => {
     expect(parsed.messages[1].attachmentCount).toBe(1)
     expect(parsed.systemMessages).toBe(1)
     expect(parsed.participants).toEqual(['Amit', 'Rohan'])
+    expect(parsed.dateOrderAmbiguous).toBe(false)
   })
 
   it('infers MDY from an unambiguous date', () => {
     const parsed = parseWhatsAppText(`12/31/24, 9:04 PM - Amit: hello\n01/13/25, 7:10 AM - Maya: hi`)
     expect(parsed.dateOrder).toBe('mdy')
+    expect(parsed.dateOrderAmbiguous).toBe(false)
     expect(new Date(parsed.messages[1].sentAt).getDate()).toBe(13)
+  })
+
+  it('flags dates that need the user to choose day-first or month-first', () => {
+    const text = '03/04/2026, 9:04 pm - Amit: hello\n03/05/2026, 9:07 pm - Maya: hi'
+    const automatic = parseWhatsAppText(text)
+    expect(automatic.dateOrder).toBe('dmy')
+    expect(automatic.dateOrderAmbiguous).toBe(true)
+    expect(new Date(automatic.messages[0].sentAt).getMonth()).toBe(3)
+
+    const monthFirst = parseWhatsAppText(text, { dateOrder: 'mdy' })
+    expect(monthFirst.dateOrderAmbiguous).toBe(false)
+    expect(new Date(monthFirst.messages[0].sentAt).getMonth()).toBe(2)
   })
 })
 
