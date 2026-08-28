@@ -3,7 +3,7 @@ import { homedir } from 'node:os'
 import { basename, extname } from 'node:path'
 import { readFile, rm, stat } from 'node:fs/promises'
 import JSZip from 'jszip'
-import { createReadableMessagesCopy, defaultMessagesPath, listIMessageChats, openMessagesDatabase, readIMessageChat } from '../parsers/imessage.mjs'
+import { createReadableMessagesCopy, defaultMessagesPath, IMESSAGE_PARSER_VERSION, listIMessageChats, openMessagesDatabase, readIMessageChat } from '../parsers/imessage.mjs'
 import { parseVCard } from '../parsers/vcard.mjs'
 import { parseWhatsAppText } from '../parsers/whatsapp.mjs'
 import { normalizeHandle } from './identity-service.mjs'
@@ -32,6 +32,14 @@ function redactPreviewBody(value) {
 function importedArchiveHashes(source) {
   if (!source) return []
   try { return JSON.parse(source.config_json || '{}').importedArchiveHashes || [] } catch { return [] }
+}
+
+function whatsappSourceKey(parsed) {
+  const participants = [...(parsed.participants || [])].map((name) => normalizeName(name).toLowerCase()).sort().join('|')
+  // An extended export must retain the same source identity. The first attributable
+  // event plus the participant set is stable when later messages are appended.
+  const opening = (parsed.messages || []).slice(0, 1).map((message) => `${normalizeName(message.sender).toLowerCase()}|${message.body}|${message.attachmentCount}`).join('|')
+  return sha256(`whatsapp|${participants}|${opening}`)
 }
 
 export class ImportService {
@@ -64,6 +72,12 @@ export class ImportService {
     }
   }
 
+  async dispose() {
+    const folders = [...this.previews.values()].map((preview) => preview.tempFolder).filter(Boolean)
+    this.previews.clear()
+    await Promise.allSettled(folders.map((folder) => rm(folder, { recursive: true, force: true })))
+  }
+
   async readWhatsAppPayload(path) {
     const raw = await readFile(path)
     return this.readWhatsAppBytes(raw, basename(path))
@@ -86,7 +100,7 @@ export class ImportService {
     return this.buildWhatsAppPreview({ text, sourceBytes, label })
   }
 
-  async previewWhatsAppBytes({ name, bytes }) {
+  async previewWhatsAppBytes({ name, bytes, timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', locale = Intl.DateTimeFormat().resolvedOptions().locale || 'und' }) {
     const sourceBytes = Buffer.from(bytes)
     if (!sourceBytes.length) throw new Error('That WhatsApp export is empty.')
     if (sourceBytes.length > 250 * 1024 * 1024) throw new Error('That export is over 250 MB. Export the chat without media and try again.')
@@ -94,21 +108,21 @@ export class ImportService {
     if (!['.zip', '.txt'].includes(extname(fileName).toLowerCase())) throw new Error('Choose a WhatsApp ZIP or TXT export.')
     const payload = await this.readWhatsAppBytes(sourceBytes, fileName)
     const label = safeLabel(fileName, safeLabel(payload.innerName, 'WhatsApp conversation'))
-    return this.buildWhatsAppPreview({ text: payload.text, sourceBytes: payload.sourceBytes, label })
+    return this.buildWhatsAppPreview({ text: payload.text, sourceBytes: payload.sourceBytes, label, timeZone, locale })
   }
 
-  buildWhatsAppPreview({ text, sourceBytes, label }) {
+  buildWhatsAppPreview({ text, sourceBytes, label, timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', locale = Intl.DateTimeFormat().resolvedOptions().locale || 'und' }) {
     const sourceHash = sha256(sourceBytes)
-    const parsed = parseWhatsAppText(text, { sourceName: label })
+    const parsed = parseWhatsAppText(text, { sourceName: label, timeZone })
     if (!parsed.messages.length) throw new Error('No readable WhatsApp messages were found. Export the chat “without media” or as a ZIP/TXT and try again.')
     const firstMessage = parsed.messages[0]
-    const sourceKey = sha256(`whatsapp|${firstMessage.sentAt}|${normalizeName(firstMessage.sender).toLowerCase()}|${firstMessage.body}|${firstMessage.attachmentCount}`)
+    const sourceKey = whatsappSourceKey(parsed)
     const existingSource = this.vault.findSourceByKey('whatsapp', sourceKey)
       || this.vault.findWhatsAppSourceByFirstMessage(firstMessage)
       || this.vault.findSourceByHash(sourceHash)
     const previousArchiveHashes = importedArchiveHashes(existingSource)
     const duplicate = existingSource?.source_hash === sourceHash || previousArchiveHashes.includes(sourceHash)
-    const previewId = this.remember('whatsapp', { label, sourceHash, sourceKey, text, parsed })
+    const previewId = this.remember('whatsapp', { label, sourceHash, sourceKey, text, parsed, locale, cancelled: false, progress: { stage: 'preview_ready', importedEvents: 0, totalEvents: parsed.messages.length } })
     return {
       previewId,
       label,
@@ -117,6 +131,11 @@ export class ImportService {
       dateOrder: parsed.dateOrder,
       dateOrderAmbiguous: parsed.dateOrderAmbiguous,
       dateFormatLabel: parsed.dateFormatLabel,
+      timeZone: parsed.timeZone,
+      locale,
+      parserVersion: parsed.parserVersion,
+      mediaItemCount: parsed.mediaItemCount,
+      modalityCounts: parsed.modalityCounts,
       messageCount: parsed.messages.length,
       participantCount: parsed.participants.length,
       participants: parsed.participants,
@@ -133,15 +152,18 @@ export class ImportService {
     }
   }
 
-  updateWhatsAppDateOrder({ previewId, dateOrder }) {
+  updateWhatsAppSettings({ previewId, dateOrder, timeZone }) {
     if (!['dmy', 'mdy', 'ymd'].includes(dateOrder)) throw new Error('Choose day/month, month/day, or year/month date order.')
+    if (!String(timeZone || '').trim()) throw new Error('Choose the timezone used when this export was created.')
     const preview = this.take(previewId, 'whatsapp')
-    preview.parsed = parseWhatsAppText(preview.text, { sourceName: preview.label, dateOrder })
+    preview.parsed = parseWhatsAppText(preview.text, { sourceName: preview.label, dateOrder, timeZone })
     if (!preview.parsed.messages.length) throw new Error('No readable messages were found with that date order.')
+    preview.sourceKey = whatsappSourceKey(preview.parsed)
     return {
       dateOrder: preview.parsed.dateOrder,
       dateOrderAmbiguous: false,
       dateFormatLabel: preview.parsed.dateFormatLabel,
+      timeZone: preview.parsed.timeZone,
       startAt: preview.parsed.startAt,
       endAt: preview.parsed.endAt,
       rejectedLines: preview.parsed.rejectedLines,
@@ -151,6 +173,33 @@ export class ImportService {
         body: redactPreviewBody(message.body),
       })),
     }
+  }
+
+  updateWhatsAppDateOrder({ previewId, dateOrder, timeZone = null }) {
+    const preview = this.take(previewId, 'whatsapp')
+    return this.updateWhatsAppSettings({ previewId, dateOrder, timeZone: timeZone || preview.parsed.timeZone })
+  }
+
+  getImportProgress(previewId) {
+    const preview = this.previews.get(previewId)
+    if (!preview) throw new Error('That import preview expired. Please choose the source again.')
+    return { ...preview.progress, cancelled: Boolean(preview.cancelled) }
+  }
+
+  cancelImport(previewId) {
+    const preview = this.previews.get(previewId)
+    if (!preview) throw new Error('That import preview expired. Please choose the source again.')
+    preview.cancelled = true
+    preview.progress = { ...preview.progress, stage: 'cancelling' }
+    return { cancelling: true }
+  }
+
+  async discardPreview(previewId) {
+    const preview = this.previews.get(previewId)
+    if (!preview) return { discarded: false }
+    if (preview.tempFolder) await rm(preview.tempFolder, { recursive: true, force: true })
+    this.previews.delete(previewId)
+    return { discarded: true }
   }
 
   async commitWhatsApp({ previewId, selfName, conversationTitle = null, isGroup = null }) {
@@ -168,12 +217,18 @@ export class ImportService {
     let createdNewSource = false
     let sourceId = null
     let conversationId = null
+    let importJobId = null
     try {
       const setup = this.vault.transaction(() => {
         const sourceId = existingSource?.id || this.vault.createSource({
           type: 'whatsapp', label: preview.label, sourceHash: preview.sourceHash, sourceKey: preview.sourceKey,
           status: existingSource ? 'imported' : 'importing', startAt: preview.parsed.startAt, endAt: preview.parsed.endAt,
-          config: { dateOrder: preview.parsed.dateOrder, ignoredSystemMessages: preview.parsed.systemMessages, importedArchiveHashes: [] },
+          config: {
+            sourceFormat: 'whatsapp_export', parserVersion: preview.parsed.parserVersion,
+            dateOrder: preview.parsed.dateOrder, timeZone: preview.parsed.timeZone, locale: preview.locale,
+            mediaStorageMode: 'metadata_only', ignoredSystemMessages: preview.parsed.systemMessages,
+            rejectedLines: preview.parsed.rejectedLines, importedArchiveHashes: [],
+          },
         })
         createdNewSource = !existingSource
         const identities = new Map()
@@ -189,17 +244,22 @@ export class ImportService {
         const title = normalizeName(conversationTitle) || preview.label || preview.parsed.participants.filter((name) => name !== selfName).join(', ')
         const conversationId = this.vault.upsertConversation({
           sourceId, externalId: `whatsapp:${preview.sourceKey.slice(0, 20)}`, stableKey: `whatsapp:${preview.sourceKey}`, title,
+          existingConversationId: existingSource ? this.vault.getSingleConversationIdForSource(existingSource.id, 'WhatsApp') : null,
           isGroup: typeof isGroup === 'boolean' ? isGroup : preview.parsed.isGroup, service: 'WhatsApp', startAt: preview.parsed.startAt,
           endAt: preview.parsed.endAt, messageCount: preview.parsed.messages.length,
           participantCount: preview.parsed.participants.length,
         })
         for (const identityId of identities.values()) this.vault.linkConversationIdentity(conversationId, identityId)
-        return { sourceId, conversationId, identities }
+        const importJobId = this.vault.createImportJob({ sourceId, kind: 'whatsapp', totalEvents: preview.parsed.messages.length, stage: 'writing_encrypted_events' })
+        return { sourceId, conversationId, identities, importJobId }
       })
       sourceId = setup.sourceId
       conversationId = setup.conversationId
+      importJobId = setup.importJobId
+      preview.progress = { stage: 'writing_encrypted_events', importedEvents: 0, totalEvents: preview.parsed.messages.length }
       const batchSize = 750
       for (let offset = 0; offset < preview.parsed.messages.length; offset += batchSize) {
+        if (preview.cancelled) throw new Error('Import cancelled. No partial relationship history was kept.')
         const batch = preview.parsed.messages.slice(offset, offset + batchSize).map((message) => {
           const senderIdentityId = setup.identities.get(message.sender) || null
           return {
@@ -207,21 +267,40 @@ export class ImportService {
             eventFingerprint: sha256(`${message.sentAt}|${normalizeName(message.sender).toLowerCase()}|${message.body}|${message.attachmentCount}`), senderIdentityId,
             sentAt: message.sentAt, isFromMe: normalizeName(message.sender).toLowerCase() === me.toLowerCase(),
             body: message.body, attachmentCount: message.attachmentCount,
+            modality: message.modality, mediaItems: message.mediaItems,
+            forwardedStatus: message.forwardedStatus, quoteStatus: message.quoteStatus, editStatus: message.editStatus,
+            parserVersion: message.parserVersion, parseWarnings: message.parseWarnings, importJobId,
           }
         })
         this.vault.transaction(() => this.vault.insertMessages(batch))
+        const importedEvents = Math.min(offset + batch.length, preview.parsed.messages.length)
+        preview.progress = { stage: 'writing_encrypted_events', importedEvents, totalEvents: preview.parsed.messages.length }
+        this.vault.updateImportJob(importJobId, { importedEvents, stage: 'writing_encrypted_events' })
         await new Promise((resolve) => setImmediate(resolve))
       }
+      if (preview.cancelled) throw new Error('Import cancelled. No partial relationship history was kept.')
+      preview.progress = { ...preview.progress, stage: 'building_relationships' }
       this.vault.transaction(() => {
         this.vault.updateConversationCounts(conversationId)
-        this.vault.recordSourceImport(sourceId, preview.sourceHash, { dateOrder: preview.parsed.dateOrder, ignoredSystemMessages: preview.parsed.systemMessages }, preview.sourceKey)
+        this.vault.recordSourceImport(sourceId, preview.sourceHash, {
+          sourceFormat: 'whatsapp_export', parserVersion: preview.parsed.parserVersion,
+          dateOrder: preview.parsed.dateOrder, timeZone: preview.parsed.timeZone, locale: preview.locale,
+          mediaStorageMode: 'metadata_only', ignoredSystemMessages: preview.parsed.systemMessages,
+          rejectedLines: preview.parsed.rejectedLines,
+        }, preview.sourceKey)
         this.vault.updateSourceCounts(sourceId)
+        this.vault.updateImportJob(importJobId, { status: 'completed', importedEvents: preview.parsed.messages.length, stage: 'completed' })
       })
       this.previews.delete(previewId)
       const proposals = this.identityService.rebuildProposals()
       return { sourceId, conversationId, proposals, bootstrap: this.vault.getBootstrap() }
     } catch (error) {
       if (createdNewSource && sourceId) this.vault.deleteSource(sourceId)
+      else if (importJobId) {
+        this.vault.rollbackImportJob(importJobId)
+        if (conversationId) this.vault.updateConversationCounts(conversationId)
+        if (sourceId) this.vault.updateSourceCounts(sourceId)
+      }
       throw error
     }
   }
@@ -282,14 +361,17 @@ export class ImportService {
       const chats = listIMessageChats(db, { limit: 500 })
       const previewId = this.remember('imessage', {
         path, tempFolder: copy.folder, databasePath: copy.databasePath,
-        sourceHash: sha256(`imessage:${path}`), chats,
+        sourceHash: sha256(`imessage:${path}`), chats, cancelled: false,
+        progress: { stage: 'preview_ready', importedEvents: 0, totalEvents: 0 },
       })
       return {
         previewId,
-        path,
         chatCount: chats.length,
+        archivedChatCount: chats.filter((chat) => chat.isArchived).length,
+        parserVersion: IMESSAGE_PARSER_VERSION,
         chats: chats.map((chat) => ({
           id: chat.id, title: chat.title, service: chat.service, isGroup: chat.isGroup,
+          isArchived: chat.isArchived,
           messageCount: chat.messageCount, startAt: chat.startAt, endAt: chat.endAt,
           participantCount: chat.handles.length,
         })),
@@ -307,19 +389,36 @@ export class ImportService {
     const selected = new Set((chatIds || []).map(String))
     if (!selected.size) throw new Error('Choose at least one Messages conversation to import.')
     let db
+    let sourceId = null
+    let importJobId = null
+    let createdNewSource = false
+    const touchedConversations = []
     try {
       db = openMessagesDatabase(preview.databasePath)
-      const sourceId = this.vault.transaction(() => {
+      const totalEvents = preview.chats.filter((chat) => selected.has(chat.id)).reduce((sum, chat) => sum + chat.messageCount, 0)
+      const setup = this.vault.transaction(() => {
         let id = this.vault.getSourceIdByHash(preview.sourceHash)
-        if (!id) id = this.vault.createSource({ type: 'imessage', label: 'Messages on this Mac', sourceHash: preview.sourceHash, status: 'linked', config: { readOnlyLink: true } })
+        if (!id) {
+          id = this.vault.createSource({ type: 'imessage', label: 'Messages on this Mac', sourceHash: preview.sourceHash, status: 'importing', config: { readOnlyLink: true, sourceFormat: 'apple_messages_database', parserVersion: IMESSAGE_PARSER_VERSION, mediaStorageMode: 'metadata_only', includesArchived: true } })
+          createdNewSource = true
+        }
         const selfIdentityId = this.vault.upsertIdentity({ sourceId: id, externalId: 'self', kind: 'imessage_self', displayName: 'Me', isSelf: true })
-        for (const chatId of selected) {
-          const chat = readIMessageChat(db, chatId)
-          const identityMap = new Map([['self', selfIdentityId]])
+        const jobId = this.vault.createImportJob({ sourceId: id, kind: 'imessage', totalEvents, stage: 'reading_selected_conversations' })
+        return { sourceId: id, selfIdentityId, importJobId: jobId }
+      })
+      sourceId = setup.sourceId
+      importJobId = setup.importJobId
+      preview.progress = { stage: 'reading_selected_conversations', importedEvents: 0, totalEvents }
+      let importedEvents = 0
+      for (const chatId of selected) {
+        if (preview.cancelled) throw new Error('Import cancelled. No partial relationship history was kept.')
+        const chat = readIMessageChat(db, chatId)
+        const chatSetup = this.vault.transaction(() => {
+          const identityMap = new Map([['self', setup.selfIdentityId]])
           for (const participant of chat.participants) {
             const normalized = normalizeHandle(participant.handle) || participant.handle
             const identityId = this.vault.upsertIdentity({
-              sourceId: id, externalId: `handle:${normalized}`, kind: normalized.includes('@') ? 'email' : 'phone',
+              sourceId, externalId: `handle:${normalized}`, kind: normalized.includes('@') ? 'email' : 'phone',
               displayName: participant.displayName, handle: normalized, metadata: { service: participant.service },
             })
             identityMap.set(participant.handle, identityId)
@@ -328,36 +427,62 @@ export class ImportService {
           if (!chat.participants.length && chat.identifier) {
             const normalized = normalizeHandle(chat.identifier) || chat.identifier
             const identityId = this.vault.upsertIdentity({
-              sourceId: id, externalId: `handle:${normalized}`, kind: normalized.includes('@') ? 'email' : 'phone',
+              sourceId, externalId: `handle:${normalized}`, kind: normalized.includes('@') ? 'email' : 'phone',
               displayName: chat.title, handle: normalized, metadata: { service: chat.service },
             })
             identityMap.set(chat.identifier, identityId)
             this.vault.ensurePersonForIdentity(identityId)
           }
           const conversationId = this.vault.upsertConversation({
-            sourceId: id, externalId: chat.externalId || `chat:${chat.id}`, title: chat.title,
+            sourceId, externalId: chat.externalId || `chat:${chat.id}`, title: chat.title,
             isGroup: chat.isGroup, service: chat.service, participantCount: chat.participants.length,
             startAt: chat.messages[0]?.sentAt || null, endAt: chat.messages.at(-1)?.sentAt || null,
             messageCount: chat.messages.length,
           })
-          this.vault.linkConversationIdentity(conversationId, selfIdentityId)
+          touchedConversations.push(conversationId)
+          this.vault.linkConversationIdentity(conversationId, setup.selfIdentityId)
           for (const identityId of identityMap.values()) this.vault.linkConversationIdentity(conversationId, identityId)
-          const messageRows = chat.messages.map((message) => {
-            const senderIdentityId = message.isFromMe ? selfIdentityId : (identityMap.get(message.senderHandle) || identityMap.get(chat.identifier) || null)
+          return { identityMap, conversationId }
+        })
+        const batchSize = 750
+        for (let offset = 0; offset < chat.messages.length; offset += batchSize) {
+          if (preview.cancelled) throw new Error('Import cancelled. No partial relationship history was kept.')
+          const messageRows = chat.messages.slice(offset, offset + batchSize).map((message) => {
+            const senderIdentityId = message.isFromMe ? setup.selfIdentityId : (chatSetup.identityMap.get(message.senderHandle) || chatSetup.identityMap.get(chat.identifier) || null)
             return {
-              sourceId: id, conversationId, externalId: message.id, senderIdentityId,
+              sourceId, conversationId: chatSetup.conversationId, externalId: message.id, senderIdentityId,
               sentAt: message.sentAt, isFromMe: message.isFromMe, body: message.body,
               attachmentCount: message.attachmentCount, replyToExternalId: message.replyToExternalId,
+              modality: message.modality, mediaItems: message.mediaItems,
+              forwardedStatus: message.forwardedStatus, quoteStatus: message.quoteStatus,
+              editStatus: message.editStatus, parserVersion: message.parserVersion,
+              parseWarnings: message.parseWarnings, importJobId,
               metadata: { service: message.service },
             }
           })
-          this.vault.insertMessages(messageRows)
+          this.vault.transaction(() => this.vault.insertMessages(messageRows))
+          importedEvents += messageRows.length
+          preview.progress = { stage: 'writing_encrypted_events', importedEvents, totalEvents }
+          this.vault.updateImportJob(importJobId, { importedEvents, stage: 'writing_encrypted_events' })
+          await new Promise((resolve) => setImmediate(resolve))
         }
-        this.vault.updateSourceCounts(id)
-        return id
+        this.vault.updateConversationCounts(chatSetup.conversationId)
+      }
+      this.vault.transaction(() => {
+        this.vault.updateSourceCounts(sourceId)
+        this.vault.setSourceStatus(sourceId, 'linked')
+        this.vault.updateImportJob(importJobId, { status: 'completed', importedEvents, stage: 'completed' })
       })
       this.previews.delete(previewId)
       return { sourceId, proposals: this.identityService.rebuildProposals(), bootstrap: this.vault.getBootstrap() }
+    } catch (error) {
+      if (createdNewSource && sourceId) this.vault.deleteSource(sourceId)
+      else if (importJobId) {
+        this.vault.rollbackImportJob(importJobId)
+        for (const conversationId of touchedConversations) this.vault.updateConversationCounts(conversationId)
+        if (sourceId) this.vault.updateSourceCounts(sourceId)
+      }
+      throw error
     } finally {
       db?.close()
       await rm(preview.tempFolder, { recursive: true, force: true })

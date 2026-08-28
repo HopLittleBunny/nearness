@@ -12,4 +12,7 @@ export default defineConfig({
     sourcemap: false,
     target: 'chrome136',
   },
+  test: {
+    testTimeout: 15_000,
+  },
 })

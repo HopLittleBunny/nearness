@@ -12,7 +12,15 @@ export class CareEngine {
     const people = this.vault.getPeople().map((person) => this.vault.getPerson(person.id))
     const candidates = []
     for (const person of people) {
-      if (!person.intention || person.intentionallyQuiet || ['rest', 'boundary', 'conclude'].includes(person.intention)) continue
+      if (!person.intention || person.intentionallyQuiet || person.careDisabled || ['rest', 'boundary', 'conclude'].includes(person.intention)) continue
+      if (['revive', 'repair'].includes(person.intention) && person.norms?.reconnectionFeelsSafe !== true) {
+        candidates.push({
+          personId: person.id, actionType: 'reflection', title: `Decide what would feel safe with ${person.displayName}`,
+          reason: 'Nearness cannot establish whether reconnection is safe. A reflection comes before any contact suggestion.',
+          minutes: MINUTES.reflection, energy: 'low', dueAt: null, sourceRefs: [], priority: 0,
+        })
+        continue
+      }
       const openLoop = person.signals.openLoopCandidates.at(-1)
       if (openLoop) {
         candidates.push({

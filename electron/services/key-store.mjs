@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 async function exists(path) {
@@ -67,6 +67,16 @@ export class KeyStore {
     if (!key.startsWith('sk-') || key.length < 30) throw new Error('That does not look like a usable OpenAI API key.')
     await this.writeProtected(this.openAiKeyPath, key)
     return { configured: true }
+  }
+
+  async deleteOpenAiKey() {
+    await rm(this.openAiKeyPath, { force: true })
+    return { configured: false }
+  }
+
+  async deleteVaultKey() {
+    await rm(this.vaultKeyPath, { force: true })
+    return { deleted: true }
   }
 
   async importOpenAiKeyFromEnvFile(path) {

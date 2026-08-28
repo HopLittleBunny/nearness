@@ -33,6 +33,25 @@ describe('WhatsApp parser', () => {
     expect(monthFirst.dateOrderAmbiguous).toBe(false)
     expect(new Date(monthFirst.messages[0].sentAt).getMonth()).toBe(2)
   })
+
+  it('binds source-local timestamps to an explicit timezone', () => {
+    const text = '31/12/2025, 11:30 pm - Amit: New year soon\n31/12/2025, 11:31 pm - Maya: Yes'
+    const perth = parseWhatsAppText(text, { timeZone: 'Australia/Perth' })
+    const london = parseWhatsAppText(text, { timeZone: 'Europe/London' })
+    expect(perth.timeZone).toBe('Australia/Perth')
+    expect(perth.messages[0].sentAt).toBe('2025-12-31T15:30:00.000Z')
+    expect(london.messages[0].sentAt).toBe('2025-12-31T23:30:00.000Z')
+  })
+
+  it('keeps only media provenance metadata and never invents authorship fields', () => {
+    const parsed = parseWhatsAppText('31/12/2025, 9:04 pm - Amit: IMG-2025.jpg (file attached)', { timeZone: 'UTC' })
+    expect(parsed.mediaItemCount).toBe(1)
+    expect(parsed.messages[0].modality).toBe('image')
+    expect(parsed.messages[0].mediaItems[0]).toMatchObject({ mediaFamily: 'image', sourceReference: 'IMG-2025.jpg', storageMode: 'metadata_only' })
+    expect(parsed.messages[0].forwardedStatus).toBe('metadata_unavailable')
+    expect(parsed.messages[0].quoteStatus).toBe('unavailable')
+    expect(parsed.messages[0].editStatus).toBe('unavailable')
+  })
 })
 
 describe('Messages parser helpers', () => {

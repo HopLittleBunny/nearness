@@ -4,6 +4,7 @@ import { basename, dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 const APPLE_EPOCH_MS = 978307200000
+export const IMESSAGE_PARSER_VERSION = 'apple-messages-2.0.0'
 
 export function appleDateToIso(value) {
   if (!value) return null
@@ -84,6 +85,7 @@ export function listIMessageChats(db, { limit = 250 } = {}) {
       COALESCE(NULLIF(c.display_name, ''), NULLIF(c.chat_identifier, ''), 'Conversation') AS title,
       c.chat_identifier AS identifier,
       c.service_name AS service,
+      COALESCE(c.is_archived, 0) AS is_archived,
       CASE WHEN c.style = 43 OR COUNT(DISTINCT chj.handle_id) > 1 THEN 1 ELSE 0 END AS is_group,
       COUNT(DISTINCT cmj.message_id) AS message_count,
       MIN(m.date) AS first_date,
@@ -94,7 +96,7 @@ export function listIMessageChats(db, { limit = 250 } = {}) {
     JOIN message m ON m.ROWID = cmj.message_id
     LEFT JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
     LEFT JOIN handle h ON h.ROWID = chj.handle_id
-    WHERE c.is_archived = 0 AND COALESCE(m.item_type, 0) = 0
+    WHERE COALESCE(m.item_type, 0) = 0
     GROUP BY c.ROWID
     ORDER BY last_date DESC
     LIMIT ?
@@ -106,6 +108,7 @@ export function listIMessageChats(db, { limit = 250 } = {}) {
     identifier: row.identifier,
     service: row.service || 'iMessage',
     isGroup: Boolean(row.is_group),
+    isArchived: Boolean(row.is_archived),
     messageCount: Number(row.message_count),
     startAt: appleDateToIso(row.first_date),
     endAt: appleDateToIso(row.last_date),
@@ -145,6 +148,13 @@ export function readIMessageChat(db, chatId) {
     attachmentCount: Number(row.cache_has_attachments || 0),
     replyToExternalId: row.reply_to_guid || null,
     service: row.service || chat.service || 'iMessage',
+    modality: row.cache_has_attachments ? 'unknown' : 'text',
+    mediaItems: row.cache_has_attachments ? [{ mediaFamily: 'unknown', availabilityState: 'source_reported_only', storageMode: 'metadata_only' }] : [],
+    forwardedStatus: 'metadata_unavailable',
+    quoteStatus: row.reply_to_guid ? 'platform_marked_quote' : 'unavailable',
+    editStatus: 'unavailable',
+    parserVersion: IMESSAGE_PARSER_VERSION,
+    parseWarnings: row.cache_has_attachments ? ['Messages reported an attachment; type and bytes were not copied.'] : [],
   })).filter((message) => message.sentAt && (message.body || message.attachmentCount))
   return {
     id: String(chat.id),

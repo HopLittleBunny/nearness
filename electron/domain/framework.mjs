@@ -96,6 +96,14 @@ export function defaultRelationalSelf() {
       practicalHelpSignalsCare: true,
       groupInclusionSignalsCare: true,
       directConflictStyle: null,
+      explicitAffection: null,
+      hierarchyAndAgeRolesMatter: null,
+      familyCommunityIntegrationMatters: null,
+      humourAndTeasingCarryCare: null,
+      privacyAroundAffection: null,
+      apologyAndRepairStyle: null,
+      languageAndCodeSwitching: '',
+      ritualsThatMatter: '',
       notes: '',
     },
     networkIntentions: ['protect_old_friendships', 'build_local_community', 'reduce_guilt'],
@@ -160,19 +168,26 @@ export function deriveLocalRelationshipSignals(messages, { now = new Date() } = 
   }
 }
 
-export function calculateCareAlignment({ intention, cadenceDays, lastMeaningfulAt, coverage, intentionallyQuiet = false, now = new Date() }) {
+export function calculateCareAlignment({ intention, cadenceDays, lastMeaningfulAt = null, lastContactAt = null, recencyAuthority = null, coverage, intentionallyQuiet = false, careDisabled = false, now = new Date() }) {
   if (!intention) return { state: 'needs_context', reason: 'No intention has been chosen.' }
+  if (careDisabled) return { state: 'intentionally_quiet', reason: 'Care suggestions are switched off for this relationship.' }
   if (intentionallyQuiet || ['rest', 'boundary', 'conclude'].includes(intention)) {
     return { state: 'intentionally_quiet', reason: 'The current intention does not ask for more contact.' }
   }
-  if (!lastMeaningfulAt || coverage === 'none') {
+  const contactAt = lastContactAt || lastMeaningfulAt
+  const authority = recencyAuthority || (lastMeaningfulAt ? 'user_confirmed_meaningful' : 'needs_context')
+  if (!contactAt || coverage === 'none') {
     return { state: 'needs_context', reason: 'Calls, meetings, or relevant history may be missing.' }
   }
+  if (authority === 'visible_touch_only') {
+    return { state: 'needs_context', reason: 'A visible touch exists, but Nearness cannot treat it as a mutual or meaningful contact.' }
+  }
   if (!cadenceDays) return { state: 'aligned', reason: 'No recurring cadence was chosen.' }
-  const days = Math.max(0, Math.floor((now - new Date(lastMeaningfulAt)) / 86400000))
-  if (days <= cadenceDays * 1.15) return { state: 'aligned', reason: 'Visible care broadly matches the rhythm you chose.', days }
-  if (days <= cadenceDays * 1.75) return { state: 'mostly_aligned', reason: 'There is minor drift from the rhythm you chose.', days }
-  return { state: 'under_invested', reason: 'Visible care is below the rhythm you chose; check missing channels before acting.', days }
+  const days = Math.max(0, Math.floor((now - new Date(contactAt)) / 86400000))
+  const basis = authority === 'user_confirmed_meaningful' ? 'your last meaningful contact' : 'the latest substantive visible interaction'
+  if (days <= cadenceDays * 1.15) return { state: 'aligned', reason: `Your chosen rhythm broadly matches ${basis}.`, days, authority }
+  if (days <= cadenceDays * 1.75) return { state: 'mostly_aligned', reason: `There is minor drift from ${basis}.`, days, authority }
+  return { state: 'under_invested', reason: `Your intention is ahead of ${basis}; check missing channels before acting.`, days, authority }
 }
 
 export function validateObservation(observation) {

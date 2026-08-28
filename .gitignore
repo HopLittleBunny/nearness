@@ -16,3 +16,4 @@ tmp/
 *.key
 *.p12
 *.mobileprovision
+nearness.cdx.json

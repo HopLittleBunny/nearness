@@ -8,16 +8,17 @@ It imports history you already own, keeps it in an encrypted vault on your Mac, 
 
 ## What is working
 
-- WhatsApp ZIP/TXT imports with multiline, date-order and attachment handling.
+- WhatsApp ZIP/TXT imports with multiline, explicit date-order/timezone authority and metadata-only media handling.
 - Updated WhatsApp exports merge into the existing conversation without double-counting earlier messages.
-- Read-only Apple Messages linking from `~/Library/Messages/chat.db`, including modern `attributedBody` text.
+- Read-only Apple Messages linking from `~/Library/Messages/chat.db`, including archived chats, modern `attributedBody` text, progress, cancellation and crash recovery.
 - vCard contact imports for cross-source identity proposals.
 - A two-sender export can be confirmed as a group instead of being silently treated as a direct chat.
 - User-confirmed identity resolution; a name-only match never auto-merges people.
 - A field-encrypted local SQLite vault protected by a macOS secure-storage key.
-- User-controlled bond system, closeness, trajectory, relationship form, social worlds, intention and cadence.
-- Local communication signals with explicit coverage limits.
-- Optional, per-run AI portraits and questions using redacted representative excerpts, evidence references and `store: false`.
+- User-controlled, composable roles; bond system; closeness; trajectory; relationship forms; social worlds; intention; cadence; relationship-specific norms and shared shorthand.
+- A communication-ecology view that keeps visible touch, interaction episodes and user-confirmed meaningful contact separate.
+- Manual calls/in-person moments, a user-only relationship experience profile and Expression Match without a composite score.
+- Optional, per-run AI portraits using an exact inspectable JSON payload, selectable excerpts, evidence references, consent receipts and `store: false`.
 - Capacity-aware Care suggestions with protected unallocated time and first-class rest/boundary intentions.
 - Local JSON export, source removal and complete vault deletion.
 
@@ -63,12 +64,12 @@ AI is not part of import. For each requested portrait or answer, Nearness:
 
 1. selects representative excerpts locally;
 2. redacts names, obvious phone numbers, emails, links and street-like addresses;
-3. shows the count, coverage, missing channels and sample;
-4. waits for explicit consent;
+3. shows every selected excerpt, exact final JSON, provider boundary, count, coverage, missing channels, payload hash and input-size estimate;
+4. lets the user exclude excerpts or context and waits for consent to that exact hash;
 5. sends the request with storage disabled;
 6. rejects observations without valid evidence references or with prohibited inference language.
 
-See [PRIVACY.md](PRIVACY.md), [SECURITY.md](SECURITY.md) and [docs/relationship-framework.md](docs/relationship-framework.md).
+See [PRIVACY.md](PRIVACY.md), [SECURITY.md](SECURITY.md), [communication ecology](docs/COMMUNICATION_ECOLOGY.md), [privacy impact assessment](docs/PRIVACY_IMPACT_ASSESSMENT.md), [threat model](docs/THREAT_MODEL.md) and [relationship framework](docs/relationship-framework.md).
 
 ## Open source
 

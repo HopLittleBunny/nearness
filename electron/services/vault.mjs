@@ -1,8 +1,12 @@
-import { createCipheriv, createDecipheriv, createHmac, randomBytes, randomUUID } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHmac, hkdfSync, randomBytes, randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { calculateCareAlignment, defaultRelationalSelf, deriveLocalRelationshipSignals } from '../domain/framework.mjs'
+import {
+  DEFAULT_RELATIONSHIP_NORMS, careRecency, reflectionPromptsFor,
+  summarizeCommunicationEcology,
+} from '../domain/communication-ecology.mjs'
 
 function nowIso() {
   return new Date().toISOString()
@@ -19,14 +23,16 @@ export class Vault {
     if (!Buffer.isBuffer(masterKey) || masterKey.length !== 32) throw new Error('The vault master key must be 32 bytes.')
     this.databasePath = databasePath
     this.masterKey = masterKey
+    this.encryptionKey = Buffer.from(hkdfSync('sha256', masterKey, Buffer.alloc(0), 'nearness:field-encryption:v2', 32))
     this.db = null
   }
 
   async open() {
     await mkdir(dirname(this.databasePath), { recursive: true })
     this.db = new DatabaseSync(this.databasePath)
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;')
+    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;')
     this.migrate()
+    this.recoverIncompleteImports()
     if (!this.getRelationalSelf()) this.saveRelationalSelf(defaultRelationalSelf())
     return this
   }
@@ -76,6 +82,12 @@ export class Vault {
         intention TEXT,
         cadence_days INTEGER,
         intentionally_quiet INTEGER NOT NULL DEFAULT 0,
+        analysis_disabled INTEGER NOT NULL DEFAULT 0,
+        care_disabled INTEGER NOT NULL DEFAULT 0,
+        hidden_from_atlas INTEGER NOT NULL DEFAULT 0,
+        relationship_stage TEXT,
+        household_status TEXT,
+        coparenting_status TEXT,
         notes_cipher BLOB,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -132,6 +144,13 @@ export class Vault {
         body_hash TEXT,
         attachment_count INTEGER NOT NULL DEFAULT 0,
         reply_to_external_id TEXT,
+        modality TEXT NOT NULL DEFAULT 'text',
+        forwarded_status TEXT NOT NULL DEFAULT 'metadata_unavailable',
+        quote_status TEXT NOT NULL DEFAULT 'unavailable',
+        edit_status TEXT NOT NULL DEFAULT 'unavailable',
+        parser_version TEXT,
+        parse_warnings_json TEXT NOT NULL DEFAULT '[]',
+        import_job_id TEXT,
         metadata_json TEXT NOT NULL DEFAULT '{}',
         UNIQUE(source_id, external_id)
       );
@@ -142,6 +161,7 @@ export class Vault {
       );
       CREATE TABLE IF NOT EXISTS observations (
         id TEXT PRIMARY KEY,
+        analysis_id TEXT REFERENCES analyses(id) ON DELETE CASCADE,
         person_id TEXT REFERENCES people(id) ON DELETE CASCADE,
         conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
         statement_cipher BLOB NOT NULL,
@@ -155,7 +175,8 @@ export class Vault {
         alternatives_cipher BLOB,
         user_status TEXT NOT NULL DEFAULT 'unreviewed',
         model_version TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        superseded_at TEXT
       );
       CREATE TABLE IF NOT EXISTS analyses (
         id TEXT PRIMARY KEY,
@@ -167,6 +188,9 @@ export class Vault {
         usage_json TEXT NOT NULL DEFAULT '{}',
         portrait_cipher BLOB,
         error_cipher BLOB,
+        consent_receipt_id TEXT,
+        payload_hash TEXT,
+        superseded_at TEXT,
         created_at TEXT NOT NULL,
         completed_at TEXT
       );
@@ -188,12 +212,132 @@ export class Vault {
         key TEXT PRIMARY KEY,
         value_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS source_import_jobs (
+        id TEXT PRIMARY KEY,
+        source_id TEXT REFERENCES sources(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        total_events INTEGER NOT NULL DEFAULT 0,
+        imported_events INTEGER NOT NULL DEFAULT 0,
+        stage TEXT NOT NULL,
+        error_cipher BLOB,
+        started_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS media_items (
+        id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        source_media_id TEXT,
+        mime_type TEXT,
+        media_family TEXT NOT NULL DEFAULT 'unknown',
+        size_bytes INTEGER,
+        width INTEGER,
+        height INTEGER,
+        duration_ms INTEGER,
+        content_hash TEXT,
+        availability_state TEXT NOT NULL DEFAULT 'source_reported_only',
+        storage_mode TEXT NOT NULL DEFAULT 'metadata_only',
+        source_reference_cipher BLOB,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS interaction_episodes (
+        id TEXT PRIMARY KEY,
+        person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+        conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+        structure TEXT NOT NULL,
+        start_at TEXT NOT NULL,
+        end_at TEXT NOT NULL,
+        event_ids_json TEXT NOT NULL,
+        initiated_by TEXT,
+        modality_mix_json TEXT NOT NULL DEFAULT '{}',
+        substantive INTEGER NOT NULL DEFAULT 0,
+        algorithm_version TEXT NOT NULL,
+        derived_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS manual_interactions (
+        id TEXT PRIMARY KEY,
+        person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+        occurred_at TEXT NOT NULL,
+        interaction_type TEXT NOT NULL,
+        meaningful INTEGER NOT NULL DEFAULT 0,
+        title_cipher BLOB,
+        notes_cipher BLOB,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS relationship_roles (
+        person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        is_primary INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(person_id, role)
+      );
+      CREATE TABLE IF NOT EXISTS relationship_norms (
+        person_id TEXT PRIMARY KEY REFERENCES people(id) ON DELETE CASCADE,
+        norms_cipher BLOB NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS symbolic_meanings (
+        id TEXT PRIMARY KEY,
+        person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+        symbol_cipher BLOB NOT NULL,
+        meaning_cipher BLOB NOT NULL,
+        applies_from TEXT,
+        applies_to TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS assessment_snapshots (
+        id TEXT PRIMARY KEY,
+        person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        snapshot_cipher BLOB NOT NULL,
+        inputs_json TEXT NOT NULL DEFAULT '{}',
+        algorithm_version TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        superseded_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS consent_receipts (
+        id TEXT PRIMARY KEY,
+        person_id TEXT REFERENCES people(id) ON DELETE CASCADE,
+        operation TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        response_storage_disabled INTEGER NOT NULL DEFAULT 1,
+        retention_disclosure_version TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS processing_runs (
+        id TEXT PRIMARY KEY,
+        person_id TEXT REFERENCES people(id) ON DELETE CASCADE,
+        operation TEXT NOT NULL,
+        status TEXT NOT NULL,
+        consent_receipt_id TEXT REFERENCES consent_receipts(id) ON DELETE SET NULL,
+        model TEXT,
+        input_count INTEGER NOT NULL DEFAULT 0,
+        output_count INTEGER NOT NULL DEFAULT 0,
+        error_cipher BLOB,
+        started_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS audit_events (
+        id TEXT PRIMARY KEY,
+        action TEXT NOT NULL,
+        entity_type TEXT,
+        entity_id TEXT,
+        details_cipher BLOB,
+        created_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_messages_conversation_date ON messages(conversation_id, sent_at);
       CREATE INDEX IF NOT EXISTS idx_messages_sender_date ON messages(sender_identity_id, sent_at);
       CREATE INDEX IF NOT EXISTS idx_person_identities_identity ON person_identities(identity_id);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_person_identity_unique ON person_identities(identity_id);
       CREATE INDEX IF NOT EXISTS idx_observations_person ON observations(person_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_care_actions_status ON care_actions(status, due_at);
+      CREATE INDEX IF NOT EXISTS idx_manual_interactions_person_date ON manual_interactions(person_id, occurred_at);
+      CREATE INDEX IF NOT EXISTS idx_episodes_person_date ON interaction_episodes(person_id, end_at);
+      CREATE INDEX IF NOT EXISTS idx_assessments_person_kind ON assessment_snapshots(person_id, kind, created_at);
+      CREATE INDEX IF NOT EXISTS idx_processing_person_date ON processing_runs(person_id, started_at);
     `)
     const schemaVersion = Number(this.db.prepare("SELECT value FROM metadata WHERE key = 'schema_version'").get()?.value || 0)
     if (schemaVersion < 2) {
@@ -210,6 +354,31 @@ export class Vault {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_conversation_fingerprint ON messages(conversation_id, event_fingerprint) WHERE event_fingerprint IS NOT NULL;
       `)
       this.db.prepare('INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)').run('schema_version', '2')
+    }
+    if (schemaVersion < 3) {
+      const ensureColumn = (table, column, definition) => {
+        const present = this.db.prepare(`PRAGMA table_info(${table})`).all().some((item) => item.name === column)
+        if (!present) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+      }
+      ensureColumn('people', 'analysis_disabled', 'INTEGER NOT NULL DEFAULT 0')
+      ensureColumn('people', 'care_disabled', 'INTEGER NOT NULL DEFAULT 0')
+      ensureColumn('people', 'hidden_from_atlas', 'INTEGER NOT NULL DEFAULT 0')
+      ensureColumn('people', 'relationship_stage', 'TEXT')
+      ensureColumn('people', 'household_status', 'TEXT')
+      ensureColumn('people', 'coparenting_status', 'TEXT')
+      ensureColumn('messages', 'modality', "TEXT NOT NULL DEFAULT 'text'")
+      ensureColumn('messages', 'forwarded_status', "TEXT NOT NULL DEFAULT 'metadata_unavailable'")
+      ensureColumn('messages', 'quote_status', "TEXT NOT NULL DEFAULT 'unavailable'")
+      ensureColumn('messages', 'edit_status', "TEXT NOT NULL DEFAULT 'unavailable'")
+      ensureColumn('messages', 'parser_version', 'TEXT')
+      ensureColumn('messages', 'parse_warnings_json', "TEXT NOT NULL DEFAULT '[]'")
+      ensureColumn('messages', 'import_job_id', 'TEXT')
+      ensureColumn('observations', 'analysis_id', 'TEXT')
+      ensureColumn('observations', 'superseded_at', 'TEXT')
+      ensureColumn('analyses', 'consent_receipt_id', 'TEXT')
+      ensureColumn('analyses', 'payload_hash', 'TEXT')
+      ensureColumn('analyses', 'superseded_at', 'TEXT')
+      this.db.prepare('INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)').run('schema_version', '3')
     }
   }
 
@@ -233,24 +402,24 @@ export class Vault {
   encrypt(value) {
     if (value == null) return null
     const iv = randomBytes(12)
-    const cipher = createCipheriv('aes-256-gcm', this.masterKey, iv)
+    const cipher = createCipheriv('aes-256-gcm', this.encryptionKey, iv)
     const encrypted = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()])
     const tag = cipher.getAuthTag()
-    return Buffer.concat([Buffer.from([1]), iv, tag, encrypted])
+    return Buffer.concat([Buffer.from([2]), iv, tag, encrypted])
   }
 
   decrypt(value, fallback = '') {
     if (value == null) return fallback
     try {
       const buffer = Buffer.from(value)
-      if (buffer[0] !== 1) return fallback
+      if (![1, 2].includes(buffer[0])) throw new Error('Unsupported encrypted field version.')
       const iv = buffer.subarray(1, 13)
       const tag = buffer.subarray(13, 29)
-      const decipher = createDecipheriv('aes-256-gcm', this.masterKey, iv)
+      const decipher = createDecipheriv('aes-256-gcm', buffer[0] === 1 ? this.masterKey : this.encryptionKey, iv)
       decipher.setAuthTag(tag)
       return Buffer.concat([decipher.update(buffer.subarray(29)), decipher.final()]).toString('utf8')
-    } catch {
-      return fallback
+    } catch (error) {
+      throw new Error(`Nearness detected damaged encrypted data. Restore a known-good export or remove the affected source. (${error.message})`)
     }
   }
 
@@ -275,6 +444,80 @@ export class Vault {
   getRelationalSelf() {
     const row = this.db.prepare('SELECT profile_cipher FROM relational_self WHERE id = 1').get()
     return row ? this.decryptJson(row.profile_cipher, defaultRelationalSelf()) : null
+  }
+
+  recordAudit(action, { entityType = null, entityId = null, details = {} } = {}) {
+    const id = randomUUID()
+    this.db.prepare('INSERT INTO audit_events(id, action, entity_type, entity_id, details_cipher, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(
+      id, action, entityType, entityId, this.encryptJson(details), nowIso(),
+    )
+    return id
+  }
+
+  getAuditEvents({ limit = 200 } = {}) {
+    return this.db.prepare('SELECT * FROM audit_events ORDER BY created_at DESC LIMIT ?').all(Math.max(1, Math.min(Number(limit) || 200, 1000))).map((row) => ({
+      id: row.id, action: row.action, entityType: row.entity_type, entityId: row.entity_id,
+      details: this.decryptJson(row.details_cipher, {}), createdAt: row.created_at,
+    }))
+  }
+
+  createImportJob({ sourceId, kind, totalEvents = 0, stage = 'importing' }) {
+    const id = randomUUID()
+    this.db.prepare('INSERT INTO source_import_jobs(id, source_id, kind, status, total_events, imported_events, stage, started_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)').run(
+      id, sourceId, kind, 'importing', Number(totalEvents || 0), stage, nowIso(),
+    )
+    return id
+  }
+
+  updateImportJob(jobId, { status = 'importing', importedEvents = null, stage = null, error = null } = {}) {
+    const row = this.db.prepare('SELECT * FROM source_import_jobs WHERE id = ?').get(jobId)
+    if (!row) throw new Error('Import job not found.')
+    const completedAt = ['completed', 'cancelled', 'failed', 'rolled_back'].includes(status) ? nowIso() : null
+    this.db.prepare('UPDATE source_import_jobs SET status=?, imported_events=?, stage=?, error_cipher=?, completed_at=? WHERE id=?').run(
+      status,
+      importedEvents == null ? row.imported_events : Number(importedEvents),
+      stage || row.stage,
+      error ? this.encrypt(error) : row.error_cipher,
+      completedAt || row.completed_at,
+      jobId,
+    )
+    return this.getImportJob(jobId)
+  }
+
+  getImportJob(jobId) {
+    const row = this.db.prepare('SELECT * FROM source_import_jobs WHERE id = ?').get(jobId)
+    if (!row) return null
+    return {
+      id: row.id, sourceId: row.source_id, kind: row.kind, status: row.status,
+      totalEvents: Number(row.total_events), importedEvents: Number(row.imported_events),
+      stage: row.stage, error: this.decrypt(row.error_cipher, null),
+      startedAt: row.started_at, completedAt: row.completed_at,
+    }
+  }
+
+  recoverIncompleteImports() {
+    const jobs = this.db.prepare("SELECT * FROM source_import_jobs WHERE status = 'importing'").all()
+    for (const job of jobs) {
+      const source = this.db.prepare('SELECT id, status FROM sources WHERE id = ?').get(job.source_id)
+      this.transaction(() => {
+        if (source?.status === 'importing') {
+          this.db.prepare('DELETE FROM sources WHERE id = ?').run(source.id)
+          this.db.exec('DELETE FROM people WHERE id NOT IN (SELECT DISTINCT person_id FROM person_identities)')
+        } else {
+          this.db.prepare('DELETE FROM messages WHERE import_job_id = ?').run(job.id)
+          this.updateImportJob(job.id, { status: 'rolled_back', stage: 'recovered_after_interruption', error: 'Nearness rolled back an interrupted import during startup.' })
+          if (source) this.updateSourceCounts(source.id)
+        }
+      })
+      this.recordAudit('interrupted_import_recovered', { entityType: 'source', entityId: job.source_id, details: { jobId: job.id, kind: job.kind } })
+    }
+  }
+
+  rollbackImportJob(jobId) {
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM messages WHERE import_job_id = ?').run(jobId)
+      this.updateImportJob(jobId, { status: 'rolled_back', stage: 'rolled_back' })
+    })
   }
 
   findSourceByHash(sourceHash) {
@@ -314,8 +557,9 @@ export class Vault {
     if (!row) throw new Error('Source not found.')
     const current = parseJson(row.config_json, {})
     const importedArchiveHashes = [...new Set([...(current.importedArchiveHashes || []), archiveHash].filter(Boolean))]
-    this.db.prepare("UPDATE sources SET config_json = ?, imported_at = ?, source_key = COALESCE(source_key, ?), status = 'imported' WHERE id = ?").run(
-      JSON.stringify({ ...current, ...configPatch, importedArchiveHashes }), nowIso(), sourceKey ? this.hash(`source-key:${sourceKey}`) : null, sourceId,
+    const hashedSourceKey = sourceKey ? this.hash(`source-key:${sourceKey}`) : null
+    this.db.prepare("UPDATE sources SET config_json = ?, imported_at = ?, source_key = CASE WHEN ? IS NULL THEN source_key ELSE ? END, status = 'imported' WHERE id = ?").run(
+      JSON.stringify({ ...current, ...configPatch, importedArchiveHashes }), nowIso(), hashedSourceKey, hashedSourceKey, sourceId,
     )
   }
 
@@ -328,6 +572,10 @@ export class Vault {
     }))
   }
 
+  setSourceStatus(sourceId, status) {
+    this.db.prepare('UPDATE sources SET status = ? WHERE id = ?').run(status, sourceId)
+  }
+
   deleteSource(sourceId) {
     const source = this.db.prepare('SELECT id FROM sources WHERE id = ?').get(sourceId)
     if (!source) throw new Error('Source not found.')
@@ -335,6 +583,8 @@ export class Vault {
       this.db.prepare('DELETE FROM sources WHERE id = ?').run(sourceId)
       this.db.exec(`DELETE FROM people WHERE id NOT IN (SELECT DISTINCT person_id FROM person_identities)`)
     })
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM;')
+    this.recordAudit('source_deleted', { entityType: 'source', entityId: sourceId })
     return this.getBootstrap()
   }
 
@@ -391,15 +641,22 @@ export class Vault {
     return personId
   }
 
-  upsertConversation({ sourceId, externalId, stableKey = null, title, isGroup = false, service, startAt = null, endAt = null, messageCount = 0, participantCount = 0, metadata = {} }) {
+  getSingleConversationIdForSource(sourceId, service) {
+    const candidates = this.db.prepare('SELECT id FROM conversations WHERE source_id = ? AND service = ? LIMIT 2').all(sourceId, service)
+    return candidates.length === 1 ? candidates[0].id : null
+  }
+
+  upsertConversation({ sourceId, externalId, stableKey = null, existingConversationId = null, title, isGroup = false, service, startAt = null, endAt = null, messageCount = 0, participantCount = 0, metadata = {} }) {
     const externalKey = this.hash(`conversation:${externalId}`)
     const hashedStableKey = stableKey ? this.hash(`conversation-key:${stableKey}`) : null
-    const existing = hashedStableKey
+    const existing = existingConversationId
+      ? this.db.prepare('SELECT id FROM conversations WHERE id = ? AND source_id = ?').get(existingConversationId, sourceId)
+      : hashedStableKey
       ? this.db.prepare('SELECT id FROM conversations WHERE service = ? AND stable_key = ?').get(service, hashedStableKey)
       : this.db.prepare('SELECT id FROM conversations WHERE source_id = ? AND external_id = ?').get(sourceId, externalKey)
     if (existing) {
-      this.db.prepare(`UPDATE conversations SET title_cipher=?, is_group=?, start_at=CASE WHEN start_at IS NULL OR ? < start_at THEN ? ELSE start_at END, end_at=CASE WHEN end_at IS NULL OR ? > end_at THEN ? ELSE end_at END, participant_count=MAX(participant_count, ?) WHERE id=?`).run(
-        this.encrypt(title), isGroup ? 1 : 0, startAt, startAt, endAt, endAt, participantCount, existing.id,
+      this.db.prepare(`UPDATE conversations SET stable_key=COALESCE(?, stable_key), title_cipher=?, is_group=?, start_at=CASE WHEN start_at IS NULL OR ? < start_at THEN ? ELSE start_at END, end_at=CASE WHEN end_at IS NULL OR ? > end_at THEN ? ELSE end_at END, participant_count=MAX(participant_count, ?) WHERE id=?`).run(
+        hashedStableKey, this.encrypt(title), isGroup ? 1 : 0, startAt, startAt, endAt, endAt, participantCount, existing.id,
       )
       return existing.id
     }
@@ -420,20 +677,34 @@ export class Vault {
     this.db.prepare('INSERT OR IGNORE INTO conversation_identities(conversation_id, identity_id) VALUES (?, ?)').run(conversationId, identityId)
   }
 
-  insertMessage({ sourceId, conversationId, externalId, eventFingerprint = null, senderIdentityId = null, sentAt, isFromMe = false, body = '', attachmentCount = 0, replyToExternalId = null, metadata = {} }) {
-    return this.insertMessages([{ sourceId, conversationId, externalId, eventFingerprint, senderIdentityId, sentAt, isFromMe, body, attachmentCount, replyToExternalId, metadata }])[0]
+  insertMessage({ sourceId, conversationId, externalId, eventFingerprint = null, senderIdentityId = null, sentAt, isFromMe = false, body = '', attachmentCount = 0, replyToExternalId = null, modality = null, forwardedStatus = 'metadata_unavailable', quoteStatus = 'unavailable', editStatus = 'unavailable', parserVersion = null, parseWarnings = [], importJobId = null, mediaItems = [], metadata = {} }) {
+    return this.insertMessages([{ sourceId, conversationId, externalId, eventFingerprint, senderIdentityId, sentAt, isFromMe, body, attachmentCount, replyToExternalId, modality, forwardedStatus, quoteStatus, editStatus, parserVersion, parseWarnings, importJobId, mediaItems, metadata }])[0]
   }
 
   insertMessages(messages) {
     const statement = this.db.prepare(`
-      INSERT OR IGNORE INTO messages(id, source_id, conversation_id, external_id, event_fingerprint, sender_identity_id, sent_at, is_from_me, body_cipher, body_hash, attachment_count, reply_to_external_id, metadata_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO messages(id, source_id, conversation_id, external_id, event_fingerprint, sender_identity_id, sent_at, is_from_me, body_cipher, body_hash, attachment_count, reply_to_external_id, modality, forwarded_status, quote_status, edit_status, parser_version, parse_warnings_json, import_job_id, metadata_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    const mediaStatement = this.db.prepare(`
+      INSERT INTO media_items(id, message_id, source_media_id, mime_type, media_family, size_bytes, width, height, duration_ms, content_hash, availability_state, storage_mode, source_reference_cipher, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     const ids = []
-    for (const { sourceId, conversationId, externalId, eventFingerprint = null, senderIdentityId = null, sentAt, isFromMe = false, body = '', attachmentCount = 0, replyToExternalId = null, metadata = {} } of messages) {
+    for (const { sourceId, conversationId, externalId, eventFingerprint = null, senderIdentityId = null, sentAt, isFromMe = false, body = '', attachmentCount = 0, replyToExternalId = null, modality = null, forwardedStatus = 'metadata_unavailable', quoteStatus = 'unavailable', editStatus = 'unavailable', parserVersion = null, parseWarnings = [], importJobId = null, mediaItems = [], metadata = {} } of messages) {
       const id = randomUUID()
       const externalKey = this.hash(`message:${externalId}`)
-      statement.run(id, sourceId, conversationId, externalKey, eventFingerprint ? this.hash(`event:${eventFingerprint}`) : null, senderIdentityId, sentAt, isFromMe ? 1 : 0, body ? this.encrypt(body) : null, body ? this.hash(`body:${body}`) : null, attachmentCount, replyToExternalId ? this.hash(`message:${replyToExternalId}`) : null, JSON.stringify(metadata))
+      const resolvedModality = modality || (attachmentCount ? 'unknown' : 'text')
+      const result = statement.run(id, sourceId, conversationId, externalKey, eventFingerprint ? this.hash(`event:${eventFingerprint}`) : null, senderIdentityId, sentAt, isFromMe ? 1 : 0, body ? this.encrypt(body) : null, body ? this.hash(`body:${body}`) : null, attachmentCount, replyToExternalId ? this.hash(`message:${replyToExternalId}`) : null, resolvedModality, forwardedStatus, quoteStatus, editStatus, parserVersion, JSON.stringify(parseWarnings || []), importJobId, JSON.stringify(metadata))
+      if (result.changes) {
+        const items = mediaItems.length ? mediaItems : Array.from({ length: Number(attachmentCount || 0) }, (_, index) => ({ sourceMediaId: `${externalId}:attachment:${index}`, mediaFamily: resolvedModality === 'text' ? 'unknown' : resolvedModality }))
+        for (const item of items) mediaStatement.run(
+          randomUUID(), id, item.sourceMediaId || null, item.mimeType || null, item.mediaFamily || 'unknown',
+          item.sizeBytes || null, item.width || null, item.height || null, item.durationMs || null,
+          item.contentHash || null, item.availabilityState || 'source_reported_only', item.storageMode || 'metadata_only',
+          item.sourceReference ? this.encrypt(item.sourceReference) : null, nowIso(),
+        )
+      }
       ids.push(id)
     }
     return ids
@@ -487,6 +758,183 @@ export class Vault {
     return this.getIdentityProposals().find((proposal) => proposal.id === proposalId)
   }
 
+  getRelationshipRoles(personId) {
+    return this.db.prepare('SELECT role, is_primary FROM relationship_roles WHERE person_id = ? ORDER BY is_primary DESC, role').all(personId).map((row) => ({ role: row.role, isPrimary: Boolean(row.is_primary) }))
+  }
+
+  replaceRelationshipRoles(personId, roles = [], primaryRole = null) {
+    const unique = [...new Set((roles || []).map(String).map((value) => value.trim()).filter(Boolean))]
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM relationship_roles WHERE person_id = ?').run(personId)
+      const statement = this.db.prepare('INSERT INTO relationship_roles(person_id, role, is_primary, created_at) VALUES (?, ?, ?, ?)')
+      for (const role of unique) statement.run(personId, role, role === primaryRole ? 1 : 0, nowIso())
+    })
+    return this.getRelationshipRoles(personId)
+  }
+
+  getRelationshipNorms(personId) {
+    const row = this.db.prepare('SELECT norms_cipher FROM relationship_norms WHERE person_id = ?').get(personId)
+    return { ...DEFAULT_RELATIONSHIP_NORMS, ...(row ? this.decryptJson(row.norms_cipher, {}) : {}) }
+  }
+
+  saveRelationshipNorms(personId, norms = {}) {
+    const value = { ...DEFAULT_RELATIONSHIP_NORMS, ...norms }
+    this.db.prepare('INSERT OR REPLACE INTO relationship_norms(person_id, norms_cipher, updated_at) VALUES (?, ?, ?)').run(personId, this.encryptJson(value), nowIso())
+    this.recordAudit('relationship_norms_updated', { entityType: 'person', entityId: personId, details: { fields: Object.keys(norms) } })
+    return value
+  }
+
+  getSymbolicMeanings(personId) {
+    return this.db.prepare('SELECT * FROM symbolic_meanings WHERE person_id = ? ORDER BY created_at DESC').all(personId).map((row) => ({
+      id: row.id, symbol: this.decrypt(row.symbol_cipher), meaning: this.decrypt(row.meaning_cipher),
+      appliesFrom: row.applies_from, appliesTo: row.applies_to, createdAt: row.created_at,
+    }))
+  }
+
+  addSymbolicMeaning(personId, { symbol, meaning, appliesFrom = null, appliesTo = null }) {
+    if (!String(symbol || '').trim() || !String(meaning || '').trim()) throw new Error('Add both the symbol and what it means in this relationship.')
+    const id = randomUUID()
+    this.db.prepare('INSERT INTO symbolic_meanings(id, person_id, symbol_cipher, meaning_cipher, applies_from, applies_to, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+      id, personId, this.encrypt(String(symbol).trim()), this.encrypt(String(meaning).trim()), appliesFrom || null, appliesTo || null, nowIso(),
+    )
+    this.recordAudit('symbolic_meaning_added', { entityType: 'person', entityId: personId, details: { symbolicMeaningId: id } })
+    return this.getSymbolicMeanings(personId)
+  }
+
+  deleteSymbolicMeaning(personId, meaningId) {
+    this.db.prepare('DELETE FROM symbolic_meanings WHERE id = ? AND person_id = ?').run(meaningId, personId)
+    this.recordAudit('symbolic_meaning_deleted', { entityType: 'person', entityId: personId, details: { symbolicMeaningId: meaningId } })
+    return this.getSymbolicMeanings(personId)
+  }
+
+  getManualInteractions(personId) {
+    return this.db.prepare('SELECT * FROM manual_interactions WHERE person_id = ? ORDER BY occurred_at DESC').all(personId).map((row) => ({
+      id: row.id, occurredAt: row.occurred_at, interactionType: row.interaction_type,
+      meaningful: Boolean(row.meaningful), title: this.decrypt(row.title_cipher, ''),
+      notes: this.decrypt(row.notes_cipher, ''), createdAt: row.created_at,
+    }))
+  }
+
+  addManualInteraction(personId, { occurredAt, interactionType, meaningful = false, title = '', notes = '' }) {
+    const timestamp = new Date(occurredAt)
+    if (Number.isNaN(timestamp.getTime())) throw new Error('Choose a valid date for this offline moment.')
+    const id = randomUUID()
+    this.db.prepare('INSERT INTO manual_interactions(id, person_id, occurred_at, interaction_type, meaningful, title_cipher, notes_cipher, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+      id, personId, timestamp.toISOString(), interactionType, meaningful ? 1 : 0,
+      title ? this.encrypt(String(title).trim()) : null, notes ? this.encrypt(String(notes).trim()) : null, nowIso(),
+    )
+    this.recordAudit('manual_interaction_added', { entityType: 'person', entityId: personId, details: { manualInteractionId: id, interactionType, meaningful: Boolean(meaningful) } })
+    return this.getManualInteractions(personId)
+  }
+
+  deleteManualInteraction(personId, interactionId) {
+    this.db.prepare('DELETE FROM manual_interactions WHERE id = ? AND person_id = ?').run(interactionId, personId)
+    this.recordAudit('manual_interaction_deleted', { entityType: 'person', entityId: personId, details: { manualInteractionId: interactionId } })
+    return this.getManualInteractions(personId)
+  }
+
+  replaceInteractionEpisodes(personId, episodes = []) {
+    this.transaction(() => {
+      this.db.prepare('DELETE FROM interaction_episodes WHERE person_id = ?').run(personId)
+      const statement = this.db.prepare(`
+        INSERT INTO interaction_episodes(id, person_id, conversation_id, structure, start_at, end_at, event_ids_json, initiated_by, modality_mix_json, substantive, algorithm_version, derived_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      for (const episode of episodes) statement.run(
+        randomUUID(), personId, episode.conversationId || null, episode.structure, episode.startAt, episode.endAt,
+        JSON.stringify(episode.eventIds || []), episode.initiatedBy || null, JSON.stringify(episode.modalities || {}),
+        episode.substantive ? 1 : 0, episode.algorithmVersion, nowIso(),
+      )
+    })
+    return episodes
+  }
+
+  rebuildInteractionEpisodes(personId) {
+    const ecology = summarizeCommunicationEcology(this.getMessagesForPerson(personId), this.getManualInteractions(personId))
+    this.replaceInteractionEpisodes(personId, ecology.episodes)
+    return ecology
+  }
+
+  getMediaItemsForPerson(personId) {
+    return this.db.prepare(`
+      SELECT mi.*, m.sent_at, c.is_group
+      FROM person_identities pi
+      JOIN conversation_identities ci ON ci.identity_id = pi.identity_id
+      JOIN messages m ON m.conversation_id = ci.conversation_id
+      JOIN conversations c ON c.id = m.conversation_id
+      JOIN media_items mi ON mi.message_id = m.id
+      WHERE pi.person_id = ? AND (c.is_group = 0 OR m.sender_identity_id = pi.identity_id)
+      ORDER BY m.sent_at
+    `).all(personId).map((row) => ({
+      id: row.id, messageId: row.message_id, occurredAt: row.sent_at, mediaFamily: row.media_family,
+      mimeType: row.mime_type, sizeBytes: row.size_bytes, durationMs: row.duration_ms,
+      availabilityState: row.availability_state, storageMode: row.storage_mode,
+      sourceReference: this.decrypt(row.source_reference_cipher, ''), isGroup: Boolean(row.is_group),
+    }))
+  }
+
+  saveAssessmentSnapshot(personId, kind, snapshot, { inputs = {}, algorithmVersion = 'user-report-1.0.0' } = {}) {
+    const id = randomUUID()
+    const createdAt = nowIso()
+    this.transaction(() => {
+      this.db.prepare('UPDATE assessment_snapshots SET superseded_at = ? WHERE person_id = ? AND kind = ? AND superseded_at IS NULL').run(createdAt, personId, kind)
+      this.db.prepare('INSERT INTO assessment_snapshots(id, person_id, kind, snapshot_cipher, inputs_json, algorithm_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+        id, personId, kind, this.encryptJson(snapshot), JSON.stringify(inputs), algorithmVersion, createdAt,
+      )
+    })
+    this.recordAudit('assessment_snapshot_saved', { entityType: 'person', entityId: personId, details: { assessmentId: id, kind, algorithmVersion } })
+    return this.getLatestAssessment(personId, kind)
+  }
+
+  getLatestAssessment(personId, kind) {
+    const row = this.db.prepare('SELECT * FROM assessment_snapshots WHERE person_id = ? AND kind = ? AND superseded_at IS NULL ORDER BY created_at DESC LIMIT 1').get(personId, kind)
+    return row ? {
+      id: row.id, kind: row.kind, snapshot: this.decryptJson(row.snapshot_cipher, {}),
+      inputs: parseJson(row.inputs_json, {}), algorithmVersion: row.algorithm_version, createdAt: row.created_at,
+    } : null
+  }
+
+  createConsentReceipt({ personId, operation, payloadHash, provider, model, endpoint, retentionDisclosureVersion }) {
+    const id = randomUUID()
+    this.db.prepare(`
+      INSERT INTO consent_receipts(id, person_id, operation, payload_hash, provider, model, endpoint, response_storage_disabled, retention_disclosure_version, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `).run(id, personId || null, operation, payloadHash, provider, model, endpoint, retentionDisclosureVersion, nowIso())
+    this.recordAudit('consent_recorded', { entityType: personId ? 'person' : null, entityId: personId || null, details: { consentReceiptId: id, operation, payloadHash, provider, model, endpoint, retentionDisclosureVersion } })
+    return id
+  }
+
+  createProcessingRun({ personId, operation, consentReceiptId = null, model = null, inputCount = 0 }) {
+    const id = randomUUID()
+    this.db.prepare('INSERT INTO processing_runs(id, person_id, operation, status, consent_receipt_id, model, input_count, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+      id, personId || null, operation, 'running', consentReceiptId, model, Number(inputCount || 0), nowIso(),
+    )
+    return id
+  }
+
+  completeProcessingRun(runId, { status = 'completed', outputCount = 0, error = null } = {}) {
+    this.db.prepare('UPDATE processing_runs SET status=?, output_count=?, error_cipher=?, completed_at=? WHERE id=?').run(
+      status, Number(outputCount || 0), error ? this.encrypt(error) : null, nowIso(), runId,
+    )
+  }
+
+  getProcessingHistory({ limit = 100 } = {}) {
+    return this.db.prepare(`
+      SELECT pr.*, cr.payload_hash, cr.provider, cr.endpoint, cr.response_storage_disabled, cr.retention_disclosure_version
+      FROM processing_runs pr LEFT JOIN consent_receipts cr ON cr.id = pr.consent_receipt_id
+      ORDER BY pr.started_at DESC LIMIT ?
+    `).all(Math.max(1, Math.min(Number(limit) || 100, 500))).map((row) => ({
+      id: row.id, personId: row.person_id, operation: row.operation, status: row.status,
+      model: row.model, inputCount: Number(row.input_count), outputCount: Number(row.output_count),
+      error: this.decrypt(row.error_cipher, null), startedAt: row.started_at, completedAt: row.completed_at,
+      consent: row.consent_receipt_id ? {
+        receiptId: row.consent_receipt_id, payloadHash: row.payload_hash, provider: row.provider,
+        endpoint: row.endpoint, responseStorageDisabled: Boolean(row.response_storage_disabled),
+        retentionDisclosureVersion: row.retention_disclosure_version,
+      } : null,
+    }))
+  }
+
   updatePerson(personId, changes) {
     const existing = this.db.prepare('SELECT * FROM people WHERE id = ?').get(personId)
     if (!existing) throw new Error('Person not found.')
@@ -501,11 +949,20 @@ export class Vault {
       intention: changes.intention ?? existing.intention,
       cadenceDays: changes.cadenceDays ?? existing.cadence_days,
       intentionallyQuiet: changes.intentionallyQuiet ?? Boolean(existing.intentionally_quiet),
+      analysisDisabled: changes.analysisDisabled ?? Boolean(existing.analysis_disabled),
+      careDisabled: changes.careDisabled ?? Boolean(existing.care_disabled),
+      hiddenFromAtlas: changes.hiddenFromAtlas ?? Boolean(existing.hidden_from_atlas),
+      relationshipStage: changes.relationshipStage ?? existing.relationship_stage,
+      householdStatus: changes.householdStatus ?? existing.household_status,
+      coparentingStatus: changes.coparentingStatus ?? existing.coparenting_status,
       notes: changes.notes ?? this.decrypt(existing.notes_cipher, ''),
     }
     this.db.prepare(`
-      UPDATE people SET display_name_cipher=?, primary_class=?, specific_relationship=?, social_worlds_json=?, forms_json=?, closeness=?, trajectory=?, intention=?, cadence_days=?, intentionally_quiet=?, notes_cipher=?, updated_at=? WHERE id=?
-    `).run(this.encrypt(value.displayName), value.primaryClass, value.specificRelationship, JSON.stringify(value.socialWorlds), JSON.stringify(value.forms), value.closeness, value.trajectory, value.intention, value.cadenceDays, value.intentionallyQuiet ? 1 : 0, value.notes ? this.encrypt(value.notes) : null, nowIso(), personId)
+      UPDATE people SET display_name_cipher=?, primary_class=?, specific_relationship=?, social_worlds_json=?, forms_json=?, closeness=?, trajectory=?, intention=?, cadence_days=?, intentionally_quiet=?, analysis_disabled=?, care_disabled=?, hidden_from_atlas=?, relationship_stage=?, household_status=?, coparenting_status=?, notes_cipher=?, updated_at=? WHERE id=?
+    `).run(this.encrypt(value.displayName), value.primaryClass, value.specificRelationship, JSON.stringify(value.socialWorlds), JSON.stringify(value.forms), value.closeness, value.trajectory, value.intention, value.cadenceDays, value.intentionallyQuiet ? 1 : 0, value.analysisDisabled ? 1 : 0, value.careDisabled ? 1 : 0, value.hiddenFromAtlas ? 1 : 0, value.relationshipStage || null, value.householdStatus || null, value.coparentingStatus || null, value.notes ? this.encrypt(value.notes) : null, nowIso(), personId)
+    if (Array.isArray(changes.roles)) this.replaceRelationshipRoles(personId, changes.roles, changes.primaryRole || changes.roles[0] || null)
+    if (changes.norms && typeof changes.norms === 'object') this.saveRelationshipNorms(personId, changes.norms)
+    this.recordAudit('relationship_context_updated', { entityType: 'person', entityId: personId, details: { fields: Object.keys(changes) } })
     return this.getPerson(personId)
   }
 
@@ -514,6 +971,7 @@ export class Vault {
       SELECT p.*, COUNT(DISTINCT pi.identity_id) AS identity_count,
         COUNT(DISTINCT ci.conversation_id) AS conversation_count,
         MAX(CASE WHEN c.is_group = 0 THEN m.sent_at END) AS last_message_at,
+        MAX(CASE WHEN c.is_group = 0 OR m.sender_identity_id = pi.identity_id THEN m.sent_at END) AS last_visible_at,
         COUNT(DISTINCT CASE WHEN c.is_group = 0 OR m.sender_identity_id = pi.identity_id THEN m.id END) AS message_count
       FROM people p
       LEFT JOIN person_identities pi ON pi.person_id = p.id
@@ -527,18 +985,33 @@ export class Vault {
   }
 
   personRow(row) {
+    const roles = this.getRelationshipRoles(row.id)
+    const meaningful = this.db.prepare('SELECT MAX(occurred_at) AS value FROM manual_interactions WHERE person_id = ? AND meaningful = 1').get(row.id)?.value || null
+    const recency = meaningful
+      ? { occurredAt: meaningful, authority: 'user_confirmed_meaningful' }
+      : row.last_message_at
+        ? { occurredAt: row.last_message_at, authority: 'interaction_episode' }
+        : row.last_visible_at
+          ? { occurredAt: row.last_visible_at, authority: 'visible_touch_only' }
+          : { occurredAt: null, authority: 'needs_context' }
     const alignment = calculateCareAlignment({
-      intention: row.intention, cadenceDays: row.cadence_days, lastMeaningfulAt: row.last_message_at,
-      coverage: row.message_count ? 'partial' : 'none', intentionallyQuiet: Boolean(row.intentionally_quiet),
+      intention: row.intention, cadenceDays: row.cadence_days, lastContactAt: recency.occurredAt,
+      recencyAuthority: recency.authority, coverage: row.message_count ? 'partial' : 'none',
+      intentionallyQuiet: Boolean(row.intentionally_quiet), careDisabled: Boolean(row.care_disabled),
     })
     return {
       id: row.id, displayName: this.decrypt(row.display_name_cipher), primaryClass: row.primary_class,
       specificRelationship: row.specific_relationship, socialWorlds: parseJson(row.social_worlds_json, []),
       forms: parseJson(row.forms_json, []), closeness: row.closeness, trajectory: row.trajectory,
       intention: row.intention, cadenceDays: row.cadence_days, intentionallyQuiet: Boolean(row.intentionally_quiet),
+      analysisDisabled: Boolean(row.analysis_disabled), careDisabled: Boolean(row.care_disabled),
+      hiddenFromAtlas: Boolean(row.hidden_from_atlas), relationshipStage: row.relationship_stage,
+      householdStatus: row.household_status, coparentingStatus: row.coparenting_status,
+      roles: roles.map((item) => item.role), primaryRole: roles.find((item) => item.isPrimary)?.role || roles[0]?.role || null,
+      norms: this.getRelationshipNorms(row.id),
       notes: this.decrypt(row.notes_cipher, ''), identityCount: Number(row.identity_count || 0),
       conversationCount: Number(row.conversation_count || 0), messageCount: Number(row.message_count || 0),
-      lastMessageAt: row.last_message_at, alignment,
+      lastMessageAt: row.last_message_at, lastVisibleAt: row.last_visible_at, recency, alignment,
     }
   }
 
@@ -547,6 +1020,7 @@ export class Vault {
       SELECT p.*, COUNT(DISTINCT pi.identity_id) AS identity_count,
         COUNT(DISTINCT ci.conversation_id) AS conversation_count,
         MAX(CASE WHEN c.is_group = 0 THEN m.sent_at END) AS last_message_at,
+        MAX(CASE WHEN c.is_group = 0 OR m.sender_identity_id = pi.identity_id THEN m.sent_at END) AS last_visible_at,
         COUNT(DISTINCT CASE WHEN c.is_group = 0 OR m.sender_identity_id = pi.identity_id THEN m.id END) AS message_count
       FROM people p
       LEFT JOIN person_identities pi ON pi.person_id = p.id
@@ -559,17 +1033,34 @@ export class Vault {
     const person = this.personRow(row)
     const messages = this.getMessagesForPerson(personId)
     const directMessages = messages.filter((message) => !message.isGroup)
-    const observations = this.db.prepare('SELECT * FROM observations WHERE person_id = ? ORDER BY created_at DESC').all(personId).map((item) => ({
+    const manualInteractions = this.getManualInteractions(personId)
+    const communicationEcology = summarizeCommunicationEcology(messages, manualInteractions)
+    const recency = careRecency(communicationEcology)
+    const alignment = calculateCareAlignment({
+      intention: person.intention, cadenceDays: person.cadenceDays, lastContactAt: recency.occurredAt,
+      recencyAuthority: recency.authority, coverage: messages.length ? 'partial' : manualInteractions.length ? 'offline_only' : 'none',
+      intentionallyQuiet: person.intentionallyQuiet, careDisabled: person.careDisabled,
+    })
+    const observations = this.db.prepare('SELECT * FROM observations WHERE person_id = ? AND superseded_at IS NULL ORDER BY created_at DESC').all(personId).map((item) => ({
       id: item.id, statement: this.decrypt(item.statement_cipher), construct: item.construct,
       evidenceType: item.evidence_type, evidenceRefs: parseJson(item.evidence_refs_json, []),
       timeStart: item.time_start, timeEnd: item.time_end, missing: parseJson(item.missing_json, []),
       confidence: item.confidence, alternatives: this.decryptJson(item.alternatives_cipher, []),
       userStatus: item.user_status, modelVersion: item.model_version, createdAt: item.created_at,
     }))
-    const latestAnalysis = this.db.prepare(`SELECT * FROM analyses WHERE person_id=? AND status='completed' ORDER BY completed_at DESC LIMIT 1`).get(personId)
+    const latestAnalysis = this.db.prepare(`SELECT * FROM analyses WHERE person_id=? AND status='completed' AND superseded_at IS NULL ORDER BY completed_at DESC LIMIT 1`).get(personId)
     return {
       ...person,
+      recency,
+      alignment,
       signals: { ...deriveLocalRelationshipSignals(directMessages), groupAuthoredMessageCount: messages.length - directMessages.length },
+      communicationEcology,
+      manualInteractions,
+      symbolicMeanings: this.getSymbolicMeanings(personId),
+      reflectionPrompts: reflectionPromptsFor(person),
+      experienceProfile: this.getLatestAssessment(personId, 'relationship_experience_profile'),
+      expressionMatch: this.getLatestAssessment(personId, 'expression_match'),
+      mediaItems: this.getMediaItemsForPerson(personId),
       observations,
       portrait: latestAnalysis ? this.decryptJson(latestAnalysis.portrait_cipher, null) : null,
       analysis: latestAnalysis ? { id: latestAnalysis.id, model: latestAnalysis.model, completedAt: latestAnalysis.completed_at, usage: parseJson(latestAnalysis.usage_json, {}) } : null,
@@ -593,6 +1084,9 @@ export class Vault {
       body: this.decrypt(row.body_cipher, ''), attachmentCount: row.attachment_count,
       conversationId: row.conversation_id, conversationTitle: this.decrypt(row.title_cipher), isGroup: Boolean(row.is_group),
       evidenceScope: row.is_group ? 'person_in_group' : 'direct_dyadic',
+      modality: row.modality || (row.attachment_count ? 'unknown' : 'text'), forwardedStatus: row.forwarded_status,
+      quoteStatus: row.quote_status, editStatus: row.edit_status, parserVersion: row.parser_version,
+      parseWarnings: parseJson(row.parse_warnings_json, []),
     }))
   }
 
@@ -626,20 +1120,27 @@ export class Vault {
     }))
   }
 
-  saveAnalysis({ personId, model, inputCount, usage = {}, portrait, observations = [] }) {
+  saveAnalysis({ personId, model, inputCount, usage = {}, portrait, observations = [], consentReceiptId = null, payloadHash = null }) {
     const id = randomUUID()
     const completedAt = nowIso()
     this.transaction(() => {
-      this.db.prepare(`INSERT INTO analyses(id, person_id, status, model, input_count, usage_json, portrait_cipher, created_at, completed_at) VALUES (?, ?, 'completed', ?, ?, ?, ?, ?, ?)`).run(
-        id, personId, model, inputCount, JSON.stringify(usage), this.encryptJson(portrait), completedAt, completedAt,
+      this.db.prepare(`UPDATE analyses SET superseded_at=? WHERE person_id=? AND status='completed' AND superseded_at IS NULL`).run(completedAt, personId)
+      this.db.prepare(`UPDATE observations SET superseded_at=? WHERE person_id=? AND evidence_type='model_inference' AND superseded_at IS NULL`).run(completedAt, personId)
+      this.db.prepare(`INSERT INTO analyses(id, person_id, status, model, input_count, usage_json, portrait_cipher, consent_receipt_id, payload_hash, created_at, completed_at) VALUES (?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        id, personId, model, inputCount, JSON.stringify(usage), this.encryptJson(portrait), consentReceiptId, payloadHash, completedAt, completedAt,
       )
+      const rejected = this.db.prepare(`SELECT statement_cipher, construct FROM observations WHERE person_id=? AND user_status='rejected'`).all(personId).map((row) => `${row.construct}|${this.decrypt(row.statement_cipher).toLowerCase().replace(/\s+/g, ' ').trim()}`)
+      const rejectedKeys = new Set(rejected)
       for (const observation of observations) {
+        const key = `${observation.construct}|${String(observation.statement || '').toLowerCase().replace(/\s+/g, ' ').trim()}`
+        if (rejectedKeys.has(key)) continue
         this.db.prepare(`
-          INSERT INTO observations(id, person_id, statement_cipher, construct, evidence_type, evidence_refs_json, time_start, time_end, missing_json, confidence, alternatives_cipher, user_status, model_version, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unreviewed', ?, ?)
-        `).run(randomUUID(), personId, this.encrypt(observation.statement), observation.construct, observation.evidenceType, JSON.stringify(observation.evidenceRefs || []), observation.timeStart || null, observation.timeEnd || null, JSON.stringify(observation.missing || []), observation.confidence || 'medium', this.encryptJson(observation.alternatives || []), model, completedAt)
+          INSERT INTO observations(id, analysis_id, person_id, statement_cipher, construct, evidence_type, evidence_refs_json, time_start, time_end, missing_json, confidence, alternatives_cipher, user_status, model_version, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unreviewed', ?, ?)
+        `).run(randomUUID(), id, personId, this.encrypt(observation.statement), observation.construct, observation.evidenceType, JSON.stringify(observation.evidenceRefs || []), observation.timeStart || null, observation.timeEnd || null, JSON.stringify(observation.missing || []), observation.confidence || 'medium', this.encryptJson(observation.alternatives || []), model, completedAt)
       }
     })
+    this.recordAudit('analysis_saved', { entityType: 'person', entityId: personId, details: { analysisId: id, consentReceiptId, payloadHash, model, inputCount } })
     return this.getPerson(personId)
   }
 
@@ -718,12 +1219,14 @@ export class Vault {
     return {
       exportedAt: nowIso(),
       product: 'Nearness',
-      schemaVersion: 2,
+      schemaVersion: 3,
       relationalSelf: this.getRelationalSelf(),
       sources: this.getSources(),
       people: this.getPeople().map((person) => this.getPerson(person.id)),
       groups: this.getGroups(),
       careActions: this.getCareActions(),
+      processingHistory: this.getProcessingHistory({ limit: 1000 }),
+      auditHistory: this.getAuditEvents({ limit: 1000 }),
     }
   }
 }

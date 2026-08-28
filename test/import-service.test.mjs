@@ -50,9 +50,13 @@ describe('WhatsApp import service', () => {
       const preview = await importer.previewWhatsAppBytes({
         name: 'WhatsApp Chat with Rohan.txt',
         bytes: Buffer.from('23/08/2026, 9:04 pm - Amit: Hello\n23/08/2026, 9:07 pm - Rohan: Hello back'),
+        timeZone: 'Australia/Perth',
+        locale: 'en-AU',
       })
       expect(preview.messageCount).toBe(2)
       expect(preview.participants).toEqual(['Amit', 'Rohan'])
+      expect(preview.timeZone).toBe('Australia/Perth')
+      expect(preview.parserVersion).toMatch(/^whatsapp-text-/)
     } finally {
       vault.close()
     }
@@ -144,6 +148,26 @@ describe('WhatsApp import service', () => {
       expect(vault.listIdentities()).toHaveLength(2)
       expect(vault.getPeople()).toHaveLength(0)
       expect(vault.getBootstrap().hasData).toBe(false)
+    } finally {
+      vault.close()
+    }
+  })
+
+  it('rolls back every event when a durable import is cancelled', async () => {
+    const folder = await mkdtemp(join(tmpdir(), 'nearness-import-cancel-test-'))
+    folders.push(folder)
+    const vault = await new Vault({ databasePath: join(folder, 'vault.sqlite'), masterKey: newMasterKey() }).open()
+    try {
+      const importer = new ImportService({ vault, identityService: new IdentityService({ vault }) })
+      const preview = await importer.previewWhatsAppBytes({
+        name: 'Cancel me.txt',
+        bytes: Buffer.from('23/08/2026, 9:04 pm - Amit: Hello\n23/08/2026, 9:07 pm - Rohan: Hello back'),
+      })
+      importer.cancelImport(preview.previewId)
+      await expect(importer.commitWhatsApp({ previewId: preview.previewId, selfName: 'Amit' })).rejects.toThrow(/cancelled/i)
+      expect(vault.getBootstrap().messageCount).toBe(0)
+      expect(vault.getSources()).toHaveLength(0)
+      expect(vault.getPeople()).toHaveLength(0)
     } finally {
       vault.close()
     }

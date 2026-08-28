@@ -13,9 +13,9 @@
 3. Add a vCard export if several people appear as phone numbers.
 4. Review every cross-source identity proposal; deliberately reject one ambiguous name match.
 5. Define your closeness language, current chapter and realistic weekly capacity.
-6. Open 3–5 people who matter and set bond system, closeness, form, trajectory and intention.
-7. Add missing-channel context such as “we mostly call” or “silence is normal here.”
-8. For one person, inspect the AI payload sample and run a portrait only if the selection feels acceptable.
+6. Open 3–5 people who matter and set overlapping roles, bond system, closeness, form, trajectory and intention.
+7. Add a real call or in-person moment, relationship-specific norms and one piece of shared shorthand.
+8. For one person, inspect every selected AI excerpt and the exact final JSON; exclude one excerpt and confirm the payload hash changes before opting in.
 9. Open evidence for at least one observation and mark it true or needing context.
 10. Open Care and confirm that only people with an intention appear.
 
@@ -28,8 +28,10 @@
 - Family should not inherit friendship cadence language.
 - Name-only identity matches should never merge automatically.
 - Cancel an import and confirm no source appears.
+- Force-quit during a disposable import, reopen, and confirm the interrupted import was rolled back.
 - Import the exact same WhatsApp file twice and confirm duplication is blocked.
 - Remove a source, export the archive and delete the complete vault.
+- Disable analysis, Care and atlas visibility for one person and confirm the three controls remain independent.
 
 ## Feedback worth recording
 

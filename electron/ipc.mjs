@@ -1,5 +1,6 @@
 import { BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { writeFile } from 'node:fs/promises'
+import { assertTrustedIpcSender, validateIpcArgs } from './security/ipc-schema.mjs'
 
 function presentError(error) {
   const message = String(error?.message || error || 'Something went wrong.')
@@ -14,7 +15,11 @@ function presentError(error) {
 
 function handle(channel, fn) {
   ipcMain.handle(channel, async (event, ...args) => {
-    try { return await fn(event, ...args) } catch (error) { throw presentError(error) }
+    try {
+      assertTrustedIpcSender(event, process.env.NEARNESS_DEV_URL || null)
+      validateIpcArgs(channel, args)
+      return await fn(event, ...args)
+    } catch (error) { throw presentError(error) }
   })
 }
 
@@ -46,13 +51,17 @@ export function registerIpc(runtime) {
   })
   handle('import:previewWhatsAppBytes', (_, input) => runtime.importService.previewWhatsAppBytes(input))
   handle('import:updateWhatsAppDateOrder', (_, input) => runtime.importService.updateWhatsAppDateOrder(input))
+  handle('import:updateWhatsAppSettings', (_, input) => runtime.importService.updateWhatsAppSettings(input))
+  handle('import:progress', (_, previewId) => runtime.importService.getImportProgress(previewId))
+  handle('import:cancel', (_, previewId) => runtime.importService.cancelImport(previewId))
+  handle('import:discard', (_, previewId) => runtime.importService.discardPreview(previewId))
   handle('import:commitWhatsApp', (_, input) => runtime.importService.commitWhatsApp(input))
   handle('import:previewVCard', async (event) => {
     const path = await chooseFile(event, { title: 'Choose a contacts export', filters: [{ name: 'vCard contacts', extensions: ['vcf', 'vcard'] }] })
     return path ? runtime.importService.previewVCard(path) : null
   })
   handle('import:commitVCard', (_, input) => runtime.importService.commitVCard(input))
-  handle('import:previewIMessage', (_, path) => runtime.importService.previewIMessage(path || undefined))
+  handle('import:previewIMessage', () => runtime.importService.previewIMessage())
   handle('import:commitIMessage', (_, input) => runtime.importService.commitIMessage(input))
 
   handle('sources:list', () => runtime.vault.getSources())
@@ -64,6 +73,21 @@ export function registerIpc(runtime) {
     runtime.careEngine.rebuild()
     return person
   })
+  handle('people:addManualInteraction', (_, personId, input) => {
+    const result = runtime.vault.addManualInteraction(personId, input)
+    runtime.vault.rebuildInteractionEpisodes(personId)
+    runtime.careEngine.rebuild()
+    return result
+  })
+  handle('people:deleteManualInteraction', (_, personId, interactionId) => {
+    const result = runtime.vault.deleteManualInteraction(personId, interactionId)
+    runtime.vault.rebuildInteractionEpisodes(personId)
+    runtime.careEngine.rebuild()
+    return result
+  })
+  handle('people:addSymbolicMeaning', (_, personId, input) => runtime.vault.addSymbolicMeaning(personId, input))
+  handle('people:deleteSymbolicMeaning', (_, personId, meaningId) => runtime.vault.deleteSymbolicMeaning(personId, meaningId))
+  handle('people:saveAssessment', (_, personId, kind, snapshot) => runtime.vault.saveAssessmentSnapshot(personId, kind, snapshot))
   handle('groups:list', () => runtime.vault.getGroups())
   handle('identity:listProposals', () => runtime.vault.getIdentityProposals())
   handle('identity:decide', (_, proposalId, decision) => runtime.vault.decideIdentityProposal(proposalId, decision))
@@ -77,9 +101,8 @@ export function registerIpc(runtime) {
   handle('analysis:keyStatus', async () => ({ configured: await runtime.keyStore.hasOpenAiKey(), model: runtime.analysisService.model }))
   handle('analysis:saveKey', (_, key) => runtime.keyStore.saveOpenAiKey(key))
   handle('analysis:testKey', () => runtime.analysisService.testKey())
-  handle('analysis:inspect', (_, personId) => runtime.analysisService.inspectPayload(personId))
+  handle('analysis:inspect', (_, input) => typeof input === 'string' ? runtime.analysisService.inspectPayload(input) : runtime.analysisService.inspectPayload(input.personId, input.selection))
   handle('analysis:run', (_, input) => runtime.analysisService.analyzePerson(input))
-  handle('analysis:ask', (_, input) => runtime.analysisService.askPerson(input))
   handle('analysis:observationStatus', (_, observationId, status, correction) => runtime.vault.updateObservationStatus(observationId, status, correction))
   handle('analysis:evidence', (_, personId, messageIds) => runtime.vault.getMessageExcerpts(personId, messageIds))
 
@@ -99,8 +122,11 @@ export function registerIpc(runtime) {
   })
   handle('privacy:deleteAll', async (_, confirmation) => {
     if (confirmation !== 'DELETE MY NEARNESS VAULT') throw new Error('The confirmation phrase did not match.')
-    await runtime.resetVault()
+    await runtime.resetVault({ deleteOpenAiKey: true })
     return { deleted: true }
   })
+  handle('privacy:deleteOpenAiKey', () => runtime.keyStore.deleteOpenAiKey())
+  handle('privacy:processingHistory', () => runtime.vault.getProcessingHistory())
+  handle('privacy:auditHistory', () => runtime.vault.getAuditEvents())
   handle('privacy:openFullDiskAccess', () => shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'))
 }
